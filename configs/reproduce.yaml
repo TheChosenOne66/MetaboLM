@@ -1,0 +1,32 @@
+# E0: MetaboLM official fine-tuning reproduction
+# Matches official MetaboLM_Fine-tuning.py hyperparameters exactly.
+#
+# Usage: python scripts/train.py --config configs/reproduce.yaml
+
+experiment: E0_reproduction
+seed: 42
+
+data:
+  train_path: data/processed/train.csv
+  val_path: data/processed/val.csv
+  correlation_matrix_path: data/processed/correlation_matrix.pt
+  num_metabolites: 168
+
+model:
+  # Pretrained backbone (relative to metabolm_posttrain/)
+  pretrained_ckpt: weights/best_metabolite_bert_model.pt
+  head_type: single_task
+  freeze_strategy: none
+  hidden_size: 768
+  num_diseases: 16
+
+training:
+  mode: sft
+  # ── Official hyperparameters (from recovered Fine-tuning code) ──
+  batch_size: 512          # official: batch_size = 512
+  learning_rate: 2.0e-5    # official: learning_rate_finetune = 2e-5
+  num_epochs: 40           # official: num_epochs = 40
+  warmup_ratio: 0.1        # official: int(0.1 * total_steps)
+  weight_decay: 0.01       # AdamW default
+
+output_dir: outputs/E0_reproduction

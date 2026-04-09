@@ -1,0 +1,8 @@
+torch>=2.4.0
+numpy>=1.26
+pandas>=2.2
+scikit-learn>=1.4
+scipy>=1.13
+miceforest>=5.6
+pyyaml>=6.0
+tqdm

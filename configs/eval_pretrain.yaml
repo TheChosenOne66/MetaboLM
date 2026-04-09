@@ -1,0 +1,16 @@
+# Pretrained checkpoint evaluation config
+# Usage: python scripts/eval_pretrain.py \
+#   --metabolomics /SPXvePFS/users/jytang/storage_tmp/metabolomics.csv \
+#   --diagnosis /SPXvePFS/users/jytang/storage_tmp/ICD10_prep/diagnosis_icd10.csv \
+#   --cause-of-death /SPXvePFS/users/jytang/storage_tmp/ICD10_prep/cause_of_death.csv \
+#   --checkpoint weights/best_metabolite_bert_model.pt \
+#   --output-dir outputs/pretrain_eval \
+#   --mask-rate 0.10 \
+#   --num-passes 5 \
+#   --seed 42
+
+# To also test with 15% mask (matching code default):
+# python scripts/eval_pretrain.py ... --mask-rate 0.15 --output-dir outputs/pretrain_eval_15pct
+
+# To skip healthy filtering (use all participants):
+# python scripts/eval_pretrain.py ... --skip-healthy-filter --output-dir outputs/pretrain_eval_all

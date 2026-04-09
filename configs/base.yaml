@@ -1,0 +1,12 @@
+seed: 42
+
+data:
+  raw_metabolomics_path: /SPXvePFS/users/jytang/storage_tmp/metabolomics.csv
+  raw_diagnoses_path: /SPXvePFS/users/jytang/storage_tmp/ICD10_prep/diagnosis_icd10.csv
+  raw_first_occur_path: /SPXvePFS/users/jytang/storage_tmp/ICD10_prep/first_occur_date.csv
+  raw_cause_of_death_path: /SPXvePFS/users/jytang/storage_tmp/ICD10_prep/cause_of_death.csv
+  raw_time_blood_path: /SPXvePFS/users/jytang/storage_tmp/time_blood_collected.csv
+  num_metabolites: 168
+
+model:
+  pretrained_ckpt: weights/best_metabolite_bert_model.pt
