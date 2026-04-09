@@ -1,0 +1,30 @@
+# E4: Hierarchical multi-task + LoRA (backbone frozen + low-rank on Q/V)
+experiment: E4_sft_lora
+seed: 42
+
+data:
+  train_path: data/processed/train.csv
+  val_path: data/processed/val.csv
+  correlation_matrix_path: data/processed/correlation_matrix.pt
+  num_metabolites: 168
+
+model:
+  pretrained_ckpt: weights/best_metabolite_bert_model.pt
+  head_type: hierarchical
+  freeze_strategy: lora
+  hidden_size: 768
+  num_diseases: 16
+  proj_size: 256
+  lora_rank: 8
+
+training:
+  mode: sft
+  batch_size: 512
+  learning_rate: 2.0e-5
+  num_epochs: 40
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  lambda_chapter: 1.0
+  mu_hierarchy: 0.1
+
+output_dir: outputs/E4_sft_lora
