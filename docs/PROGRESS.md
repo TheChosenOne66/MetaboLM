@@ -178,6 +178,53 @@
 
 ---
 
+### 2026-04-09 Phase 2 代码完成 (W3)
+
+**总体判断**: Phase 2 (SFT 创新) 全部代码实现完成，43 个单元测试通过，GPU 端到端验证通过。E0 剩余 15 疾病在另一台机器上跑。
+
+#### Phase 2 新增模块
+
+| 文件 | 行数 | 说明 |
+|------|------|------|
+| `src/model/heads.py` | +45行 | `HierarchicalMultiTaskHead`: 共享投影→leaf(16)+chapter(6) |
+| `src/model/adapters.py` | 65行 | `AdapterLayer` (768→64→768) + `LoRALinear` (rank-8 on Q/V) |
+| `src/model/backbone.py` | +3行 | adapter hook in CustomBertLayer |
+| `src/model/wrapper.py` | 重写 | 4种 freeze 策略 (none/head_only/adapter/lora) |
+| `src/training/losses.py` | +70行 | `HierarchicalLoss`: leaf+chapter BCE + hierarchy penalty |
+| `src/training/metrics.py` | +50行 | `compute_multitask_metrics` + `compute_hierarchy_violation_rate` |
+| `src/training/sft_trainer.py` | +180行 | `MultiTaskSFTTrainer`: 联合训练 + mean AUC 模型选择 |
+| `src/data/dataset.py` | +40行 | `MultiTaskDataset`: 自动推导 chapter labels |
+| `scripts/train_multitask.py` | 195行 | E1-E4 训练入口 + pos_weight 计算 |
+| `configs/sft_*.yaml` | 4文件 | E1 (full FT) / E2 (head only) / E3 (adapter) / E4 (lora) |
+| `tests/test_heads.py` | 45行 | 3 个 head 测试 |
+| `tests/test_adapters.py` | 170行 | 14 个 adapter/LoRA/wrapper 集成测试 |
+
+#### 参数量验证（test_adapters.py 确认）
+
+| 策略 | 可训练参数 | 占比 |
+|------|-----------|------|
+| E1: none | ~85M | 100% |
+| E2: head_only | ~203K | 0.24% |
+| E3: adapter | ~1.39M | 1.61% |
+| E4: lora | ~497K | 0.58% |
+
+#### 设计决策
+
+1. **数据策略**: E1-E4 使用全量 train.csv (338K)，通过 `pos_weight = N_neg / N_pos` 平衡类别，不做物理采样
+2. **参数高效方案**: 手写 Adapter/LoRA（非 HuggingFace PEFT），因为 MetaboLM backbone 是自定义 BERT
+3. **Adapter 位置**: 插入每层 CustomBertLayer 的 FFN 之后（LayerNorm 之后）
+4. **LoRA 目标**: 每层 attention 的 Q 和 V 投影矩阵
+5. **模型选择**: 按 16 疾病 mean AUROC 选最优 epoch
+
+#### 下一步
+
+- [ ] E0 剩余 15 疾病完成（另一台机器）
+- [ ] 执行 E1-E4 实验
+- [ ] E0 vs E1-E4 对比分析
+- [ ] Phase 3 (GRPO RL) 或直接进入论文撰写
+
+---
+
 ## 变更日志
 
 | 日期 | 事项 |
@@ -191,3 +238,5 @@
 | 2026-03-30~04-08 | 完成全部 E0 代码：heads.py, wrapper.py, dataset.py, losses.py, metrics.py, sft_trainer.py, train.py |
 | 2026-04-08 | Pretrain 评估已跑，指标与论文差距 8x（MSE 0.57 vs 0.07），根因为健康队列定义不一致导致 z-score 参数偏移 |
 | 2026-04-08 | W2 进度评审：代码 95% 完成，但 E0 复现实验未执行，里程碑未达成 |
+| 2026-04-09 | Phase 2 代码全部完成：HierarchicalMultiTaskHead, AdapterLayer, LoRALinear, HierarchicalLoss, MultiTaskSFTTrainer, train_multitask.py, 4个E1-E4配置 |
+| 2026-04-09 | 43 个单元测试全部通过，GPU 端到端 2-epoch adapter 训练验证通过 |
