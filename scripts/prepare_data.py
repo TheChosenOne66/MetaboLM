@@ -48,7 +48,7 @@ def main() -> None:
     parser.add_argument("--config", required=True, help="Path to YAML config file.")
     parser.add_argument(
         "--correlation-matrix",
-        default="/SPXvePFS/users/jytang/metabolm_posttrain/_reference_correlation_matrix.csv",
+        default="_reference_correlation_matrix.csv",
         help="Path to reference correlation-matrix CSV (168x168).",
     )
     parser.add_argument("--skip-labels", action="store_true", help="Skip diagnosis labelling (for quick testing).")
