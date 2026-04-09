@@ -1,24 +1,23 @@
-"""Model wrapper: backbone + classification head.
+"""Model wrapper: backbone + classification head + freeze strategies.
 
-Matches the official ``MetaboliteBERTForClassification`` forward path:
-  expressions -> Hadamard embed -> prepend [CLS] -> BERT encoder
-  -> AdaptiveAvgPool1d (pooler_output) -> classifier head -> logits
+Supports four freeze strategies for parameter-efficient fine-tuning:
+  - none: full fine-tune, all parameters trainable
+  - head_only: freeze entire backbone, train only the classification head
+  - adapter: freeze backbone, inject AdapterLayer per Transformer layer
+  - lora: freeze backbone, inject LoRA on Q/V attention projections
 
-Key equivalence notes (vs official MetaboLM_Fine-tuning.py):
-- Uses ``pooler_output`` (avg pool over ALL tokens), NOT ``[CLS]`` hidden state.
-- The official code manually re-implements embedding in the wrapper forward;
-  we delegate to ``backbone._embed_and_encode()`` which is numerically identical.
-- State dict key prefix: ``self.metabolite_model.*`` for backbone params,
-  matching the official ``module.metabolite_model.*`` (minus DataParallel prefix).
+For E0 (single-task), this matches the official forward path exactly.
+For E1-E4 (multi-task), the head returns (leaf_logits, chapter_logits).
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
+from .adapters import AdapterLayer, LoRALinear
 from .backbone import MetaboliteBERTModel
 
 
@@ -27,48 +26,73 @@ class MetaboLMForClassification(nn.Module):
 
     Args:
         metabolite_model: Pretrained ``MetaboliteBERTModel`` backbone.
-        head: Classification head (``SingleTaskHead`` or future variants).
+        head: Classification head (``SingleTaskHead`` or ``HierarchicalMultiTaskHead``).
+        freeze_strategy: One of ``"none"``, ``"head_only"``, ``"adapter"``, ``"lora"``.
+        adapter_bottleneck: Bottleneck dim for adapter (default 64).
+        lora_rank: Rank for LoRA (default 8).
     """
 
     def __init__(
         self,
         metabolite_model: MetaboliteBERTModel,
         head: nn.Module,
+        freeze_strategy: str = "none",
+        adapter_bottleneck: int = 64,
+        lora_rank: int = 8,
     ) -> None:
         super().__init__()
-        # Name matches official checkpoint key structure: module.metabolite_model.*
         self.metabolite_model = metabolite_model
         self.head = head
+        self.freeze_strategy = freeze_strategy
+        self._apply_freeze_strategy(adapter_bottleneck, lora_rank)
+
+    def _apply_freeze_strategy(
+        self, adapter_bottleneck: int, lora_rank: int
+    ) -> None:
+        """Freeze backbone parameters and optionally inject adapters or LoRA."""
+        if self.freeze_strategy == "none":
+            return  # All params trainable
+
+        # All other strategies freeze the backbone
+        for param in self.metabolite_model.parameters():
+            param.requires_grad = False
+
+        if self.freeze_strategy == "head_only":
+            return  # Only head is trainable
+
+        elif self.freeze_strategy == "adapter":
+            hidden_size = self.metabolite_model.hidden_size
+            for layer in self.metabolite_model.bert.encoder.layer:
+                layer.adapter = AdapterLayer(hidden_size, adapter_bottleneck)
+
+        elif self.freeze_strategy == "lora":
+            for layer in self.metabolite_model.bert.encoder.layer:
+                attn = layer.attention.self
+                attn.query = LoRALinear(attn.query, lora_rank)
+                attn.value = LoRALinear(attn.value, lora_rank)
+
+        else:
+            raise ValueError(f"Unknown freeze_strategy: {self.freeze_strategy}")
 
     def forward(
         self,
         expressions: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, ...]]]:
-        """Forward pass matching official fine-tuning code.
-
-        Official code path::
-
-            expr_embeds = expressions.unsqueeze(-1) * expr_weight + expr_bias
-            embeddings = cat([cls_token, expr_embeds], dim=1)
-            outputs = bert(inputs_embeds=embeddings, ...)
-            pooled_output = outputs['pooler_output']
-            logits = classifier(pooled_output).squeeze(-1)
-
-        Our equivalent path::
-
-            outputs = metabolite_model._embed_and_encode(expressions, ...)
-            pooled_output = outputs['pooler_output']
-            logits = head(pooled_output)
+    ) -> Tuple[
+        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        Optional[Tuple[torch.Tensor, ...]],
+    ]:
+        """Forward pass.
 
         Args:
             expressions: ``(B, num_metabolites)`` expression values.
-            attention_mask: ``(B, num_metabolites)`` attention mask (all-ones).
+            attention_mask: ``(B, num_metabolites)`` attention mask.
 
         Returns:
-            Tuple of ``(logits, attentions)``.
-            - logits: ``(B,)`` for SingleTaskHead, ``(B, D)`` for multi-task.
-            - attentions: tuple of per-layer attention weight tensors, or None.
+            Tuple of ``(head_output, attentions)``.
+            - head_output: ``(B,)`` for SingleTaskHead,
+              ``(leaf_logits, chapter_logits)`` for HierarchicalMultiTaskHead.
+            - attentions: tuple of per-layer attention weights, or None.
         """
         outputs = self.metabolite_model._embed_and_encode(
             expressions,
@@ -76,5 +100,5 @@ class MetaboLMForClassification(nn.Module):
             output_attentions=True,
         )
         pooled_output = outputs["pooler_output"]
-        logits = self.head(pooled_output)
-        return logits, outputs["attentions"]
+        head_output = self.head(pooled_output)
+        return head_output, outputs["attentions"]

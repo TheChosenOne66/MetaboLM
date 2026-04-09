@@ -78,6 +78,112 @@ def test_lora_param_count():
     print("test_lora_param_count PASSED")
 
 
+def test_wrapper_freeze_head_only():
+    """head_only: backbone frozen, head trainable."""
+    from src.model.backbone import MetaboliteBERTModel
+    from src.model.heads import HierarchicalMultiTaskHead
+    from src.model.wrapper import MetaboLMForClassification
+
+    backbone = MetaboliteBERTModel(num_metabolites=168,
+                                    bias_matrix=torch.randn(169, 169))
+    head = HierarchicalMultiTaskHead()
+    model = MetaboLMForClassification(backbone, head, freeze_strategy="head_only")
+
+    backbone_trainable = sum(p.numel() for p in model.metabolite_model.parameters()
+                             if p.requires_grad)
+    head_trainable = sum(p.numel() for p in model.head.parameters()
+                         if p.requires_grad)
+    assert backbone_trainable == 0, f"Backbone should be frozen, got {backbone_trainable}"
+    assert head_trainable > 0, f"Head should be trainable, got {head_trainable}"
+    print(f"test_wrapper_freeze_head_only PASSED (head trainable: {head_trainable:,})")
+
+
+def test_wrapper_freeze_adapter():
+    """adapter: backbone frozen, adapters + head trainable."""
+    from src.model.backbone import MetaboliteBERTModel
+    from src.model.heads import HierarchicalMultiTaskHead
+    from src.model.wrapper import MetaboLMForClassification
+
+    backbone = MetaboliteBERTModel(num_metabolites=168,
+                                    bias_matrix=torch.randn(169, 169))
+    head = HierarchicalMultiTaskHead()
+    model = MetaboLMForClassification(backbone, head, freeze_strategy="adapter",
+                                       adapter_bottleneck=64)
+
+    total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    ratio = total_trainable / total_params
+    print(f"test_wrapper_freeze_adapter: trainable={total_trainable:,}, "
+          f"total={total_params:,}, ratio={ratio:.4f}")
+    assert ratio < 0.05, f"Adapter ratio too high: {ratio}"
+    print("test_wrapper_freeze_adapter PASSED")
+
+
+def test_wrapper_freeze_lora():
+    """lora: backbone frozen, LoRA + head trainable."""
+    from src.model.backbone import MetaboliteBERTModel
+    from src.model.heads import HierarchicalMultiTaskHead
+    from src.model.wrapper import MetaboLMForClassification
+
+    backbone = MetaboliteBERTModel(num_metabolites=168,
+                                    bias_matrix=torch.randn(169, 169))
+    head = HierarchicalMultiTaskHead()
+    model = MetaboLMForClassification(backbone, head, freeze_strategy="lora",
+                                       lora_rank=8)
+
+    total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    ratio = total_trainable / total_params
+    print(f"test_wrapper_freeze_lora: trainable={total_trainable:,}, "
+          f"total={total_params:,}, ratio={ratio:.4f}")
+    assert ratio < 0.02, f"LoRA ratio too high: {ratio}"
+    print("test_wrapper_freeze_lora PASSED")
+
+
+def test_wrapper_adapter_forward():
+    """Full forward pass with adapter freeze works."""
+    from src.model.backbone import MetaboliteBERTModel
+    from src.model.heads import HierarchicalMultiTaskHead
+    from src.model.wrapper import MetaboLMForClassification
+
+    backbone = MetaboliteBERTModel(num_metabolites=168,
+                                    bias_matrix=torch.randn(169, 169))
+    head = HierarchicalMultiTaskHead()
+    model = MetaboLMForClassification(backbone, head, freeze_strategy="adapter")
+
+    x = torch.randn(2, 168)
+    mask = torch.ones(2, 168, dtype=torch.long)
+    (leaf, chapter), attn = model(x, mask)
+    assert leaf.shape == (2, 16), f"Expected (2,16), got {leaf.shape}"
+    assert chapter.shape == (2, 6), f"Expected (2,6), got {chapter.shape}"
+
+    loss = leaf.sum() + chapter.sum()
+    loss.backward()
+    print("test_wrapper_adapter_forward PASSED")
+
+
+def test_wrapper_lora_forward():
+    """Full forward pass with LoRA freeze works."""
+    from src.model.backbone import MetaboliteBERTModel
+    from src.model.heads import HierarchicalMultiTaskHead
+    from src.model.wrapper import MetaboLMForClassification
+
+    backbone = MetaboliteBERTModel(num_metabolites=168,
+                                    bias_matrix=torch.randn(169, 169))
+    head = HierarchicalMultiTaskHead()
+    model = MetaboLMForClassification(backbone, head, freeze_strategy="lora")
+
+    x = torch.randn(2, 168)
+    mask = torch.ones(2, 168, dtype=torch.long)
+    (leaf, chapter), attn = model(x, mask)
+    assert leaf.shape == (2, 16)
+    assert chapter.shape == (2, 6)
+
+    loss = leaf.sum() + chapter.sum()
+    loss.backward()
+    print("test_wrapper_lora_forward PASSED")
+
+
 if __name__ == "__main__":
     test_adapter_forward_shape()
     test_adapter_residual()
@@ -86,4 +192,9 @@ if __name__ == "__main__":
     test_lora_init_identity()
     test_lora_freezes_original()
     test_lora_param_count()
+    test_wrapper_freeze_head_only()
+    test_wrapper_freeze_adapter()
+    test_wrapper_freeze_lora()
+    test_wrapper_adapter_forward()
+    test_wrapper_lora_forward()
     print("All adapter/LoRA tests passed!")

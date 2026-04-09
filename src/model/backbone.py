@@ -163,6 +163,8 @@ class CustomBertLayer(nn.Module):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.is_decoder: bool = config.is_decoder
+        # Optional adapter, set externally for parameter-efficient fine-tuning
+        self.adapter = None
         if self.is_decoder:
             self.crossattention = CustomBertAttention(config)
 
@@ -208,6 +210,8 @@ class CustomBertLayer(nn.Module):
         layer_output = self.output(intermediate_output)
         layer_output = self.dropout(layer_output)
         layer_output = self.LayerNorm(layer_output + attention_output)
+        if self.adapter is not None:
+            layer_output = self.adapter(layer_output)
         outputs = (layer_output,) + outputs
 
         return outputs
