@@ -37,3 +37,51 @@ class SingleTaskHead(nn.Module):
             ``(B,)`` logits (one scalar per sample).
         """
         return self.classifier(pooled_output).squeeze(-1)
+
+
+class HierarchicalMultiTaskHead(nn.Module):
+    """Chapter + Leaf joint classification head.
+
+    Architecture::
+
+        pooler_output (768) -> shared_proj (768->256->ReLU->Dropout)
+                                    |               |
+                              leaf_head (256->16)  chapter_head (256->6)
+
+    Args:
+        hidden_size: Input dimension from backbone pooler (default 768).
+        proj_size: Shared projection output dimension (default 256).
+        num_diseases: Number of leaf disease outputs (default 16).
+        num_chapters: Number of ICD-10 chapter outputs (default 6).
+        dropout: Dropout rate in shared projection (default 0.1).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int = 768,
+        proj_size: int = 256,
+        num_diseases: int = 16,
+        num_chapters: int = 6,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.shared_proj = nn.Sequential(
+            nn.Linear(hidden_size, proj_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.leaf_head = nn.Linear(proj_size, num_diseases)
+        self.chapter_head = nn.Linear(proj_size, num_chapters)
+
+    def forward(
+        self, pooled_output: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            pooled_output: ``(B, hidden_size)`` from backbone pooler.
+
+        Returns:
+            Tuple of ``(leaf_logits (B, num_diseases), chapter_logits (B, num_chapters))``.
+        """
+        h = self.shared_proj(pooled_output)
+        return self.leaf_head(h), self.chapter_head(h)
