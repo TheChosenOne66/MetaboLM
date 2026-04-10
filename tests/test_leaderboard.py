@@ -154,3 +154,72 @@ def test_parse_e0_nonexistent_dir_returns_planned():
         FIXTURES / "outputs" / "does_not_exist", CANONICAL_DISEASES
     )
     assert result["status"] == ulb.ExperimentStatus.PLANNED
+
+
+# ── parse_multitask tests ───────────────────────────────────────────────
+
+def test_parse_multitask_complete():
+    result = ulb.parse_multitask(
+        FIXTURES / "outputs" / "e1_complete", CANONICAL_DISEASES
+    )
+    assert result["status"] == ulb.ExperimentStatus.COMPLETED
+    assert result["mean_auroc"] == 0.8472  # from summary.json
+    assert result["trainable_params"] == 85123456
+    assert result["total_params"] == 85123456
+    assert result["freeze_strategy"] == "none"
+    assert result["best_epoch"] == 28
+    assert len(result["per_disease_auroc"]) == 16
+    assert result["per_disease_auroc"]["T2D"] == 0.871
+    assert result["error_message"] is None
+
+
+def test_parse_multitask_filters_mean_row():
+    """MEAN row in CSV must NOT appear as a disease key."""
+    result = ulb.parse_multitask(
+        FIXTURES / "outputs" / "e1_complete", CANONICAL_DISEASES
+    )
+    assert "MEAN" not in result["per_disease_auroc"]
+
+
+def test_parse_multitask_prefers_json_over_csv_mean():
+    """When summary.json and csv MEAN row disagree, json wins."""
+    result = ulb.parse_multitask(
+        FIXTURES / "outputs" / "e1_json_csv_mismatch", CANONICAL_DISEASES
+    )
+    assert result["status"] == ulb.ExperimentStatus.COMPLETED
+    # json says 0.85, csv MEAN row says 0.83 — expect json value
+    assert result["mean_auroc"] == 0.85
+
+
+def test_parse_multitask_missing_disease_in_csv():
+    """15/16 diseases in CSV: status still completed, missing disease absent from dict."""
+    result = ulb.parse_multitask(
+        FIXTURES / "outputs" / "e1_missing_disease", CANONICAL_DISEASES
+    )
+    assert result["status"] == ulb.ExperimentStatus.COMPLETED
+    assert len(result["per_disease_auroc"]) == 15
+    assert "prostate_cancer" not in result["per_disease_auroc"]
+    assert "T2D" in result["per_disease_auroc"]
+
+
+def test_parse_multitask_malformed_json_returns_error():
+    result = ulb.parse_multitask(
+        FIXTURES / "outputs" / "e1_malformed_json", CANONICAL_DISEASES
+    )
+    assert result["status"] == ulb.ExperimentStatus.ERROR
+    assert result["error_message"] is not None
+    assert "json" in result["error_message"].lower()
+
+
+def test_parse_multitask_missing_dir_returns_planned():
+    result = ulb.parse_multitask(
+        FIXTURES / "outputs" / "e0_empty", CANONICAL_DISEASES  # dir exists but no files
+    )
+    assert result["status"] == ulb.ExperimentStatus.PLANNED
+
+
+def test_parse_multitask_nonexistent_dir_returns_planned():
+    result = ulb.parse_multitask(
+        FIXTURES / "outputs" / "does_not_exist", CANONICAL_DISEASES
+    )
+    assert result["status"] == ulb.ExperimentStatus.PLANNED

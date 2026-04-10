@@ -277,6 +277,128 @@ def parse_per_disease_sft(
     }
 
 
+def parse_multitask(
+    exp_dir: Path, canonical_diseases: list[str]
+) -> dict[str, Any]:
+    """Parse E1-E6 output: read summary.json + multitask_metrics.csv.
+
+    Both files required for COMPLETED status. Missing file(s) → PLANNED.
+    Parse error → ERROR with error_message. Used for both multitask_sft
+    and multitask_rl experiment types (identical output schema).
+    """
+    exp_dir = Path(exp_dir)
+    summary_path = exp_dir / "summary.json"
+    csv_path = exp_dir / "multitask_metrics.csv"
+
+    empty_result: dict[str, Any] = {
+        "status": ExperimentStatus.PLANNED,
+        "mean_auroc": None,
+        "mean_auprc": None,
+        "hierarchy_violation_rate": None,
+        "per_disease_auroc": {},
+        "per_disease_auprc": {},
+        "trainable_params": None,
+        "total_params": None,
+        "freeze_strategy": None,
+        "best_epoch": None,
+        "num_completed_diseases": None,
+        "error_message": None,
+    }
+
+    if not exp_dir.exists() or not summary_path.exists() or not csv_path.exists():
+        return empty_result
+
+    # Parse summary.json
+    try:
+        with open(summary_path, "r") as f:
+            summary = json.load(f)
+    except json.JSONDecodeError as e:
+        return {**empty_result, "status": ExperimentStatus.ERROR,
+                "error_message": f"summary.json parse error: {e}"}
+    except Exception as e:
+        return {**empty_result, "status": ExperimentStatus.ERROR,
+                "error_message": f"summary.json read error: {e}"}
+
+    # Parse multitask_metrics.csv
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as e:
+        return {**empty_result, "status": ExperimentStatus.ERROR,
+                "error_message": f"multitask_metrics.csv parse error: {e}"}
+
+    if "Disease" not in df.columns or "Val_AUC" not in df.columns:
+        return {**empty_result, "status": ExperimentStatus.ERROR,
+                "error_message": "CSV missing Disease/Val_AUC columns"}
+
+    # Filter out the MEAN row explicitly; it's an aggregate, not a disease
+    df_diseases = df[df["Disease"] != "MEAN"]
+
+    per_disease_auroc: dict[str, float] = {}
+    canonical_set = set(canonical_diseases)
+    for _, row in df_diseases.iterrows():
+        disease = str(row["Disease"])
+        if disease not in canonical_set:
+            print(
+                f"[WARN] parse_multitask({exp_dir.name}): "
+                f"unknown disease '{disease}' in CSV, skipping",
+                file=sys.stderr,
+            )
+            continue
+        try:
+            per_disease_auroc[disease] = float(row["Val_AUC"])
+        except (ValueError, TypeError):
+            continue
+
+    # Prefer summary.json.best_mean_auc; fall back to CSV MEAN row
+    mean_auroc: float | None = None
+    if "best_mean_auc" in summary:
+        try:
+            mean_auroc = float(summary["best_mean_auc"])
+        except (ValueError, TypeError):
+            pass
+
+    csv_mean: float | None = None
+    mean_rows = df[df["Disease"] == "MEAN"]
+    if len(mean_rows) > 0:
+        try:
+            csv_mean = float(mean_rows.iloc[0]["Val_AUC"])
+        except (ValueError, TypeError):
+            pass
+
+    if mean_auroc is not None and csv_mean is not None:
+        if abs(mean_auroc - csv_mean) > 1e-3:
+            print(
+                f"[INFO] parse_multitask({exp_dir.name}): "
+                f"mean AUROC mismatch: json={mean_auroc:.4f}, "
+                f"csv_mean_row={csv_mean:.4f}, using json",
+                file=sys.stderr,
+            )
+    elif mean_auroc is None and csv_mean is not None:
+        mean_auroc = csv_mean
+
+    # trainable_params / total_params from summary.json
+    def _int_or_none(val: Any) -> int | None:
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return None
+
+    return {
+        "status": ExperimentStatus.COMPLETED,
+        "mean_auroc": mean_auroc,
+        "mean_auprc": None,  # Not emitted by current trainers
+        "hierarchy_violation_rate": summary.get("hierarchy_violation_rate"),
+        "per_disease_auroc": per_disease_auroc,
+        "per_disease_auprc": {},
+        "trainable_params": _int_or_none(summary.get("trainable_params")),
+        "total_params": _int_or_none(summary.get("total_params")),
+        "freeze_strategy": summary.get("freeze_strategy"),
+        "best_epoch": _int_or_none(summary.get("best_epoch")),
+        "num_completed_diseases": len(per_disease_auroc),
+        "error_message": None,
+    }
+
+
 def main() -> int:
     """CLI entry point. Returns exit code."""
     raise NotImplementedError("main() implemented in Task 9")
