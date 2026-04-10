@@ -1,0 +1,8 @@
+{
+  "experiment": "E1_mismatch",
+  "freeze_strategy": "none",
+  "best_epoch": 30,
+  "best_mean_auc": 0.8500,
+  "trainable_params": 85123456,
+  "total_params": 85123456
+}

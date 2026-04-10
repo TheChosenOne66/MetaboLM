@@ -1,0 +1,8 @@
+{
+  "experiment": "E1_full_ft",
+  "freeze_strategy": "none",
+  "best_epoch": 28,
+  "best_mean_auc": 0.8472,
+  "trainable_params": 85123456,
+  "total_params": 85123456
+}

@@ -1,0 +1,4 @@
+Disease,Best_Epoch,Val_AUC,Val_Acc,Val_Precision,Val_Recall,Val_F1,Num_Disease,Num_Healthy
+T2D,24,0.866,0.784,0.778,0.794,0.786,26816,26816
+obesity,22,0.812,0.740,0.730,0.750,0.740,15000,15000
+hypertension,30,0.795,0.720,0.710,0.730,0.720,40000,40000

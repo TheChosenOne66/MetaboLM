@@ -2,6 +2,8 @@
 weights/
 best_metabolite_bert_model.pt.zip
 outputs/
+!tests/fixtures/**/outputs/
+!tests/fixtures/**/outputs/**
 
 # Large data files
 data/processed/train.csv
