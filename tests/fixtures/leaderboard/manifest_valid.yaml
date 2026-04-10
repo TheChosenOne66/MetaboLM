@@ -1,0 +1,36 @@
+experiments:
+  - id: E0
+    display_name: "E0 — Test Baseline"
+    phase: phase1
+    type: per_disease_sft
+    config: configs/reproduce.yaml
+    output_dir: outputs/e0_complete
+    description: "Test E0"
+    innovation: null
+
+  - id: E1
+    display_name: "E1 — Test Multitask"
+    phase: phase2
+    type: multitask_sft
+    config: configs/sft_full_ft.yaml
+    output_dir: outputs/e1_complete
+    description: "Test E1"
+    innovation: "Test innovation"
+
+diseases:
+  - T2D
+  - obesity
+  - hypertension
+  - ischemic_heart
+  - atrial_fib
+  - heart_failure
+  - rheumatoid
+  - asthma
+  - dementia
+  - copd
+  - stroke
+  - parkinsons
+  - breast_cancer
+  - colon_cancer
+  - lung_cancer
+  - prostate_cancer
