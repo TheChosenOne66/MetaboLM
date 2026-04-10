@@ -315,3 +315,115 @@ def test_collect_experiment_rows_resolves_relative_paths(tmp_path):
     )
     rows = ulb.collect_experiment_rows(manifest, repo_root=tmp_path)
     assert rows[0].status == ulb.ExperimentStatus.COMPLETED
+
+
+# ── render_markdown tests ────────────────────────────────────────────────
+
+def _make_completed_multitask_row(id="E1"):
+    return ulb.ExperimentRow(
+        id=id,
+        display_name=f"{id} — Test",
+        phase="phase2",
+        exp_type=ulb.ExperimentType.MULTITASK_SFT,
+        config=f"configs/{id.lower()}.yaml",
+        output_dir=f"outputs/{id.lower()}",
+        description="Test experiment",
+        innovation="Test innovation",
+        status=ulb.ExperimentStatus.COMPLETED,
+        mean_auroc=0.8472,
+        mean_auprc=0.3215,
+        hierarchy_violation_rate=0.028,
+        trainable_params=85123456,
+        total_params=85123456,
+        freeze_strategy="none",
+        best_epoch=28,
+        per_disease_auroc={d: 0.80 + i * 0.005 for i, d in enumerate(CANONICAL_DISEASES)},
+        num_completed_diseases=16,
+    )
+
+
+def _make_planned_row(id="E5"):
+    return ulb.ExperimentRow(
+        id=id,
+        display_name=f"{id} — Planned",
+        phase="phase3",
+        exp_type=ulb.ExperimentType.MULTITASK_RL,
+        config=f"configs/{id.lower()}.yaml",
+        output_dir=f"outputs/{id.lower()}",
+        description="Not yet run",
+        innovation=None,
+        status=ulb.ExperimentStatus.PLANNED,
+    )
+
+
+def test_render_summary_table_has_all_experiments():
+    rows = [_make_completed_multitask_row("E1"), _make_planned_row("E5")]
+    md = ulb.render_markdown(rows, CANONICAL_DISEASES)
+    assert "E1 — Test" in md
+    assert "E5 — Planned" in md
+
+
+def test_render_per_disease_table_dimensions():
+    rows = [_make_completed_multitask_row("E1"), _make_planned_row("E5")]
+    md = ulb.render_markdown(rows, CANONICAL_DISEASES)
+    # Per-disease section header
+    assert "## Per-Disease AUROC" in md
+    # All 16 diseases in the left column
+    for disease in CANONICAL_DISEASES:
+        assert disease in md
+    # MEAN row
+    assert "**MEAN**" in md or "| MEAN " in md
+
+
+def test_render_status_icons():
+    rows = [
+        _make_completed_multitask_row("E1"),
+        _make_planned_row("E5"),
+    ]
+    md = ulb.render_markdown(rows, CANONICAL_DISEASES)
+    assert "✅" in md
+    assert "⬜" in md
+
+
+def test_render_partial_shows_fraction():
+    row = ulb.ExperimentRow(
+        id="E0", display_name="E0 — Partial", phase="phase1",
+        exp_type=ulb.ExperimentType.PER_DISEASE_SFT,
+        config="configs/reproduce.yaml", output_dir="outputs/E0",
+        description="test", innovation=None,
+        status=ulb.ExperimentStatus.PARTIAL,
+        mean_auroc=0.866,
+        num_completed_diseases=1,
+        per_disease_auroc={"T2D": 0.866},
+    )
+    md = ulb.render_markdown([row], CANONICAL_DISEASES)
+    assert "⚡" in md
+    assert "1/16" in md
+    assert "⚠️" in md  # partial mean warning
+
+
+def test_render_formats_params_human_readable():
+    row = _make_completed_multitask_row("E1")
+    md = ulb.render_markdown([row], CANONICAL_DISEASES)
+    # 85123456 should render as ~85.1M
+    assert "85.1M" in md or "85M" in md
+
+
+def test_render_placeholder_for_none():
+    row = _make_planned_row("E5")
+    md = ulb.render_markdown([row], CANONICAL_DISEASES)
+    # Planned row has all-None metrics; should show dashes
+    assert "—" in md
+
+
+def test_render_error_row():
+    row = ulb.ExperimentRow(
+        id="E3", display_name="E3 — Broken", phase="phase2",
+        exp_type=ulb.ExperimentType.MULTITASK_SFT,
+        config="configs/sft_adapter.yaml", output_dir="outputs/E3",
+        description="test", innovation=None,
+        status=ulb.ExperimentStatus.ERROR,
+        error_message="JSON parse error: ...",
+    )
+    md = ulb.render_markdown([row], CANONICAL_DISEASES)
+    assert "❌" in md
