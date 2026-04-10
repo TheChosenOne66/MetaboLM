@@ -96,3 +96,61 @@ diseases:
     with pytest.raises(SystemExit) as exc:
         ulb.load_manifest(bad)
     assert exc.value.code == 1
+
+
+# ── parse_per_disease_sft tests ─────────────────────────────────────────
+
+CANONICAL_DISEASES = [
+    "T2D", "obesity", "hypertension", "ischemic_heart", "atrial_fib",
+    "heart_failure", "rheumatoid", "asthma", "dementia", "copd",
+    "stroke", "parkinsons", "breast_cancer", "colon_cancer",
+    "lung_cancer", "prostate_cancer",
+]
+
+
+def test_parse_e0_complete_returns_completed_status():
+    result = ulb.parse_per_disease_sft(
+        FIXTURES / "outputs" / "e0_complete", CANONICAL_DISEASES
+    )
+    assert result["status"] == ulb.ExperimentStatus.COMPLETED
+    assert result["num_completed_diseases"] == 16
+    assert len(result["per_disease_auroc"]) == 16
+    assert result["per_disease_auroc"]["T2D"] == 0.866
+    assert result["per_disease_auroc"]["dementia"] == 0.890
+
+
+def test_parse_e0_mean_auroc_is_arithmetic_mean():
+    result = ulb.parse_per_disease_sft(
+        FIXTURES / "outputs" / "e0_complete", CANONICAL_DISEASES
+    )
+    # Arithmetic mean of the 16 Val_AUC values in e0_complete fixture
+    expected = (0.866 + 0.812 + 0.795 + 0.840 + 0.820 + 0.855 + 0.760 + 0.730
+                + 0.890 + 0.870 + 0.790 + 0.830 + 0.720 + 0.700 + 0.870 + 0.810) / 16
+    assert abs(result["mean_auroc"] - expected) < 1e-6
+
+
+def test_parse_e0_partial_returns_partial_status():
+    result = ulb.parse_per_disease_sft(
+        FIXTURES / "outputs" / "e0_partial", CANONICAL_DISEASES
+    )
+    assert result["status"] == ulb.ExperimentStatus.PARTIAL
+    assert result["num_completed_diseases"] == 3
+    assert len(result["per_disease_auroc"]) == 3
+    assert "T2D" in result["per_disease_auroc"]
+    assert "prostate_cancer" not in result["per_disease_auroc"]
+
+
+def test_parse_e0_missing_dir_returns_planned():
+    result = ulb.parse_per_disease_sft(
+        FIXTURES / "outputs" / "e0_empty", CANONICAL_DISEASES
+    )
+    assert result["status"] == ulb.ExperimentStatus.PLANNED
+    assert result["num_completed_diseases"] is None
+    assert result["per_disease_auroc"] == {}
+
+
+def test_parse_e0_nonexistent_dir_returns_planned():
+    result = ulb.parse_per_disease_sft(
+        FIXTURES / "outputs" / "does_not_exist", CANONICAL_DISEASES
+    )
+    assert result["status"] == ulb.ExperimentStatus.PLANNED

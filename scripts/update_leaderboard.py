@@ -177,6 +177,106 @@ def load_manifest(path: Path) -> Manifest:
     return Manifest(experiments=experiments, diseases=list(diseases))
 
 
+# ── Parsers ───────────────────────────────────────────────────────────────
+
+def parse_per_disease_sft(
+    exp_dir: Path, canonical_diseases: list[str]
+) -> dict[str, Any]:
+    """Parse E0 output: read finetune_summary_metrics.csv.
+
+    Returns a dict with keys that map onto ExperimentRow fields.
+    Never raises — on any error returns status=ERROR with error_message.
+    """
+    exp_dir = Path(exp_dir)
+    csv_path = exp_dir / "finetune_summary_metrics.csv"
+
+    empty_result: dict[str, Any] = {
+        "status": ExperimentStatus.PLANNED,
+        "mean_auroc": None,
+        "mean_auprc": None,
+        "per_disease_auroc": {},
+        "per_disease_auprc": {},
+        "trainable_params": None,
+        "total_params": None,
+        "freeze_strategy": None,
+        "best_epoch": None,
+        "num_completed_diseases": None,
+        "error_message": None,
+    }
+
+    if not exp_dir.exists() or not csv_path.exists():
+        return empty_result
+
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as e:
+        return {**empty_result, "status": ExperimentStatus.ERROR,
+                "error_message": f"CSV parse error: {e}"}
+
+    if "Disease" not in df.columns or "Val_AUC" not in df.columns:
+        return {**empty_result, "status": ExperimentStatus.ERROR,
+                "error_message": "CSV missing required columns Disease/Val_AUC"}
+
+    per_disease_auroc: dict[str, float] = {}
+    canonical_set = set(canonical_diseases)
+    for _, row in df.iterrows():
+        disease = str(row["Disease"])
+        if disease not in canonical_set:
+            print(
+                f"[WARN] parse_per_disease_sft({exp_dir.name}): "
+                f"unknown disease '{disease}' in CSV, skipping",
+                file=sys.stderr,
+            )
+            continue
+        try:
+            per_disease_auroc[disease] = float(row["Val_AUC"])
+        except (ValueError, TypeError):
+            print(
+                f"[WARN] parse_per_disease_sft({exp_dir.name}): "
+                f"non-numeric Val_AUC for '{disease}', skipping",
+                file=sys.stderr,
+            )
+            continue
+
+    n_done = len(per_disease_auroc)
+    if n_done == 0:
+        return empty_result
+
+    mean_auroc = sum(per_disease_auroc.values()) / n_done
+
+    # Best epoch: take max across completed rows (for display only)
+    best_epoch: int | None = None
+    if "Best_Epoch" in df.columns:
+        try:
+            valid_epochs = [
+                int(e) for e, d in zip(df["Best_Epoch"], df["Disease"])
+                if str(d) in canonical_set
+            ]
+            if valid_epochs:
+                best_epoch = max(valid_epochs)
+        except (ValueError, TypeError):
+            pass
+
+    status = (
+        ExperimentStatus.COMPLETED if n_done == len(canonical_diseases)
+        else ExperimentStatus.PARTIAL
+    )
+
+    return {
+        "status": status,
+        "mean_auroc": mean_auroc,
+        "mean_auprc": None,  # E0 CSV has no AUPRC
+        "per_disease_auroc": per_disease_auroc,
+        "per_disease_auprc": {},
+        "trainable_params": None,  # E0 hardcoded size, not in CSV
+        "total_params": None,
+        "freeze_strategy": None,
+        "best_epoch": best_epoch,
+        "num_completed_diseases": n_done,
+        "error_message": None,
+    }
+
+
 def main() -> int:
     """CLI entry point. Returns exit code."""
     raise NotImplementedError("main() implemented in Task 9")
