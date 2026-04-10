@@ -4,35 +4,79 @@
 
 ## 概述
 
-MetaboLM 是一个在 83,744 名健康参与者的血浆代谢组学数据上预训练的 Transformer（BERT-like）模型，捕捉 168 种 NMR 代谢物之间的交互模式。本项目在预训练模型的基础上构建了完整的下游训练与评估流水线。
+MetaboLM 是一个在 83,744 名健康参与者的血浆代谢组学数据上预训练的 Transformer（BERT-like）模型，捕捉 168 种 NMR 代谢物之间的交互模式。本项目在预训练模型的基础上构建了完整的下游训练与评估流水线，围绕三个阶段展开：
+
+- **Phase 1 — E0 复现**：逐疾病独立监督微调，对齐原论文的 16 种疾病 AUROC
+- **Phase 2 — E1-E4 SFT 创新**：层次化多任务联合训练 + 参数高效微调对比（Full FT / Head Only / Adapter / LoRA）
+- **Phase 3 — E5-E6 GRPO RL**：在最优 SFT checkpoint 基础上用强化学习优化校准与层次一致性
 
 **支持的功能：**
 
 - **E0 复现**：逐疾病监督微调（SFT），复现原论文 16 种疾病的 AUROC 结果
+- **层次化多任务学习**：16 种疾病 + 6 个 ICD-10 章节共享投影头，联合 BCE + 层次一致性惩罚
+- **参数高效微调**：Adapter（~1.61%）和 LoRA（~0.58%）两套手写实现，与 Full FT / Head Only 组成系统对比
+- **GRPO 强化学习**：校准奖励（ECE 驱动）与层次一致性奖励（违反率驱动），带 KL 正则的参考策略
 - **预训练评估**：Masked metabolite reconstruction，验证预训练 checkpoint 有效性
 - **数据流水线**：Raw UK Biobank → 清洗/标注/切分/归一化 → 训练就绪数据集
-- **模型架构**：MetaboliteBERTModel（12 层, 8 头, hidden=768, ~85M 参数）+ 分类头
+- **模型架构**：MetaboliteBERTModel（12 层, 8 头, hidden=768, ~85M 参数）+ 单任务/层次化分类头
+
+## 核心创新
+
+本项目的论文创新点（2026-04-09 确认）共三项：
+
+1. **层次化多任务学习**
+   16 种疾病（leaf）+ 6 个 ICD-10 章节（parent）共享同一投影层。稀有疾病可通过同章节高频疾病的梯度得到隐式正则，缓解 single-task 训练在正样本稀缺时的过拟合。
+   实现：`src/model/heads.py::HierarchicalMultiTaskHead`、`src/data/dataset.py::MultiTaskDataset`（章节标签由 leaf 标签 OR 聚合自动推导）。
+
+2. **层次一致性约束**
+   训练损失中加入惩罚项 μ·max(0, P(leaf) − P(parent_chapter))，强制"子病概率不高于所属章节概率"。评估阶段用 Hierarchy Violation Rate 作为独立指标监控逻辑一致性。
+   实现：`src/training/losses.py::HierarchicalLoss`、`src/training/metrics.py::compute_hierarchy_violation_rate`。
+
+3. **参数高效微调系统比较**
+   首次在代谢组学预训练模型上系统对比 Full FT / Head-only / Adapter / LoRA 四种策略（E1-E4），在同一多任务框架下报告 mean AUROC / trainable params / wall time，回答"PEFT 在 85M 代谢物 BERT 上是否有效"。
+   实现：`src/model/adapters.py`（AdapterLayer + LoRALinear）、`src/model/wrapper.py::MetaboLMForClassification`（4 种 freeze 策略）。
+
+详见 `docs/PROGRESS.md` 的"Phase 2 代码完成"与"设计决策"章节。
 
 ## 项目结构
 
 ```
 metabolm_posttrain/
 ├── scripts/
-│   ├── train.py                # E0 微调主脚本
+│   ├── train.py                # E0 微调主脚本（per-disease 独立训练）
+│   ├── train_multitask.py      # E1-E4 多任务训练主脚本
+│   ├── train_rl.py             # E5-E6 GRPO RL 训练主脚本
+│   ├── smoke_test.py           # E1-E6 端到端快速验证（256 样本 × 2 epochs）
+│   ├── compare_experiments.py  # 跨实验指标汇总
 │   ├── prepare_data.py         # 数据预处理流水线
 │   ├── eval_pretrain.py        # 预训练 checkpoint 评估
 │   └── download_weights.sh     # 下载预训练权重
 ├── configs/
 │   ├── reproduce.yaml          # E0 训练配置
+│   ├── sft_full_ft.yaml        # E1: 层次化多任务 + 全量微调
+│   ├── sft_head_only.yaml      # E2: 层次化多任务 + 仅训练 head
+│   ├── sft_adapter.yaml        # E3: 层次化多任务 + Adapter
+│   ├── sft_lora.yaml           # E4: 层次化多任务 + LoRA
+│   ├── rl_calibration.yaml     # E5: GRPO + 校准奖励
+│   ├── rl_hierarchy.yaml       # E6: GRPO + 层次一致性奖励
 │   ├── base.yaml               # 数据预处理配置
 │   └── eval_pretrain.yaml      # 预训练评估配置
 ├── src/
 │   ├── config.py               # 配置加载（dataclass + YAML）
-│   ├── data/                   # 数据流水线（biomarkers, cohort, preprocessing, dataset）
-│   ├── model/                  # 模型（backbone, heads, wrapper）
-│   ├── training/               # 训练（SFT trainer, losses, metrics）
+│   ├── data/                   # biomarkers, endpoints, cohort, preprocessing, dataset (含 MultiTaskDataset)
+│   ├── model/
+│   │   ├── backbone.py         # MetaboliteBERTModel + CustomBertLayer (含 adapter hook)
+│   │   ├── heads.py            # SingleTaskHead + HierarchicalMultiTaskHead
+│   │   ├── adapters.py         # AdapterLayer + LoRALinear
+│   │   └── wrapper.py          # MetaboLMForClassification (4 种 freeze 策略)
+│   ├── training/
+│   │   ├── sft_trainer.py      # SFTTrainer (E0) + MultiTaskSFTTrainer (E1-E4)
+│   │   ├── grpo_trainer.py     # GRPOTrainer (E5-E6)
+│   │   ├── losses.py           # BCE + HierarchicalLoss
+│   │   ├── metrics.py          # AUROC/F1 + hierarchy violation rate
+│   │   └── rewards.py          # calibration_reward + hierarchy_reward + combined_reward
 │   └── evaluation/             # 评估模块
-├── tests/                      # 单元测试
+├── tests/                      # 单元测试（43 个，覆盖 backbone/heads/adapters/multitask dataset/GRPO）
 ├── data/processed/             # 预处理后的数据（gitignore）
 ├── weights/                    # 模型权重（gitignore）
 ├── outputs/                    # 训练输出（gitignore）
@@ -50,7 +94,7 @@ cd /path/to/metabolm_posttrain
 pip install -r requirements.txt
 ```
 
-依赖：torch>=2.4.0, numpy>=1.26, pandas>=2.2, scikit-learn>=1.4, scipy>=1.13, pyyaml>=6.0, tqdm
+依赖：torch>=2.4.0, numpy>=1.26, pandas>=2.2, scikit-learn>=1.4, scipy>=1.13, pyyaml>=6.0, tqdm, transformers
 
 ### 1. 下载预训练权重
 
@@ -74,7 +118,7 @@ python scripts/prepare_data.py --config configs/base.yaml
 
 输出至 `data/processed/`：train.csv, val.csv, correlation_matrix.pt, normalization_stats.csv
 
-### 3. E0 微调训练
+### 3. E0 复现：逐疾病微调
 
 ```bash
 # 训练全部 16 种疾病（串行，约 15-20 小时）
@@ -99,7 +143,39 @@ E0_reproduction/
 └── ...
 ```
 
-### 4. 预训练评估
+### 4. E1-E4 层次化多任务微调
+
+与 E0 不同，E1-E4 训练**单一模型**同时预测 16 种疾病 + 6 个 ICD-10 章节，使用全量 train.csv 配合 `pos_weight = N_neg / N_pos` 做类别平衡（不再做 1:1 物理采样），按 16 疾病 mean AUROC 选最优 epoch。
+
+```bash
+python scripts/train_multitask.py --config configs/sft_full_ft.yaml      # E1: Full FT (~85M trainable)
+python scripts/train_multitask.py --config configs/sft_head_only.yaml    # E2: Head Only (~203K, 0.24%)
+python scripts/train_multitask.py --config configs/sft_adapter.yaml      # E3: Adapter  (~1.39M, 1.61%)
+python scripts/train_multitask.py --config configs/sft_lora.yaml         # E4: LoRA     (~497K, 0.58%)
+```
+
+每次运行输出至 `outputs/<experiment>/`：`best_model.pt`、`multitask_metrics.csv`（16 种疾病 + MEAN 的 AUC/F1）、`summary.json`（best epoch、mean AUC、可训练参数占比）。
+
+### 5. E5-E6 GRPO 强化学习
+
+在最优 SFT checkpoint 基础上，用 Group Relative Policy Optimisation 继续优化。参考策略（frozen SFT 副本）提供 KL 正则。
+
+```bash
+python scripts/train_rl.py --config configs/rl_calibration.yaml   # E5: 校准奖励 (ECE 驱动)
+python scripts/train_rl.py --config configs/rl_hierarchy.yaml     # E6: 层次一致性奖励 (违反率驱动)
+```
+
+注意：两个 RL 配置的 `model.sft_ckpt` 默认指向 `outputs/E1_sft_full_ft/best_model.pt`，先跑完 E1 再跑 E5/E6；若选择其他 E2-E4 作为起点，修改该字段即可。
+
+### 6. 端到端快速冒烟测试
+
+在真机上跑一遍 E1-E6 的完整代码路径（256 样本 × 2 epochs，~1-2 分钟）：
+
+```bash
+python scripts/smoke_test.py
+```
+
+### 7. 预训练评估
 
 ```bash
 python scripts/eval_pretrain.py \
@@ -126,7 +202,9 @@ python scripts/eval_pretrain.py \
 | 乳腺癌 | C50 | 结肠癌 | C18 |
 | 肺癌 | C34 | 前列腺癌 | C61 |
 
-## 训练超参数（E0）
+## 训练超参数
+
+### E0（逐疾病独立微调）
 
 | 参数 | 值 |
 |------|-----|
@@ -138,7 +216,39 @@ python scripts/eval_pretrain.py \
 | Warmup | 10% linear |
 | Scheduler | Cosine |
 | Loss | BCEWithLogitsLoss |
-| 模型选择 | Best validation AUROC |
+| 类别平衡 | 1:1 欠采样 |
+| 模型选择 | Best validation AUROC（单疾病） |
+
+### E1-E4（层次化多任务 SFT）
+
+| 参数 | 值 |
+|------|-----|
+| Optimizer | AdamW |
+| Learning rate | 2e-5 |
+| Weight decay | 0.01 |
+| Batch size | 512 |
+| Epochs | 40 |
+| Warmup | 10% linear |
+| Scheduler | Cosine |
+| Loss | HierarchicalLoss = L_leaf + λ·L_chapter + μ·L_hierarchy（λ=1.0, μ=0.1） |
+| 类别平衡 | 全量 train.csv + 逐列 pos_weight = N_neg / N_pos |
+| 模型选择 | Best mean AUROC across 16 diseases |
+| Freeze 策略 | E1 none / E2 head_only / E3 adapter (bottleneck=64) / E4 lora (rank=8, Q&V) |
+
+### E5-E6（GRPO RL）
+
+| 参数 | 值 |
+|------|-----|
+| Learning rate | 1e-5 |
+| Weight decay | 0.01 |
+| Batch size | 128 |
+| Epochs | 20 |
+| Warmup | 10% linear |
+| Group size (K) | 4 |
+| KL coefficient | 0.1 |
+| 起点 | `outputs/E1_sft_full_ft/best_model.pt`（可改为其它 SFT） |
+| 参考策略 | Frozen deepcopy of initial policy |
+| Reward | E5 calibration / E6 hierarchy |
 
 ## 运行测试
 
@@ -146,7 +256,7 @@ python scripts/eval_pretrain.py \
 python -m pytest tests/
 ```
 
-覆盖模型架构（前向传播 shape、参数量）、代谢物字段映射、疾病端点定义。
+43 个单元测试，覆盖 backbone 前向/参数量、biomarkers 字段映射、disease endpoints、`HierarchicalMultiTaskHead`、`AdapterLayer` + `LoRALinear` + wrapper 集成（参数量验证）、`MultiTaskDataset`、GRPO rewards + trainer 完整训练循环。
 
 ## 参考
 
