@@ -223,3 +223,95 @@ def test_parse_multitask_nonexistent_dir_returns_planned():
         FIXTURES / "outputs" / "does_not_exist", CANONICAL_DISEASES
     )
     assert result["status"] == ulb.ExperimentStatus.PLANNED
+
+
+# ── collect_experiment_rows tests ────────────────────────────────────────
+
+def test_collect_experiment_rows_mixed(tmp_path):
+    # Build a manifest pointing at real fixtures
+    manifest = ulb.Manifest(
+        experiments=[
+            ulb.ManifestExperiment(
+                id="E0", display_name="E0 test", phase="phase1",
+                exp_type=ulb.ExperimentType.PER_DISEASE_SFT,
+                config="configs/reproduce.yaml",
+                output_dir=str(FIXTURES / "outputs" / "e0_partial"),
+                description="test", innovation=None,
+            ),
+            ulb.ManifestExperiment(
+                id="E1", display_name="E1 test", phase="phase2",
+                exp_type=ulb.ExperimentType.MULTITASK_SFT,
+                config="configs/sft_full_ft.yaml",
+                output_dir=str(FIXTURES / "outputs" / "e1_complete"),
+                description="test", innovation="innov",
+            ),
+            ulb.ManifestExperiment(
+                id="E2", display_name="E2 test", phase="phase2",
+                exp_type=ulb.ExperimentType.MULTITASK_SFT,
+                config="configs/sft_head_only.yaml",
+                output_dir=str(FIXTURES / "outputs" / "does_not_exist"),
+                description="test", innovation=None,
+            ),
+        ],
+        diseases=CANONICAL_DISEASES,
+    )
+    rows = ulb.collect_experiment_rows(manifest, repo_root=tmp_path)
+    assert len(rows) == 3
+    assert rows[0].id == "E0"
+    assert rows[0].status == ulb.ExperimentStatus.PARTIAL
+    assert rows[1].id == "E1"
+    assert rows[1].status == ulb.ExperimentStatus.COMPLETED
+    assert rows[2].id == "E2"
+    assert rows[2].status == ulb.ExperimentStatus.PLANNED
+
+
+def test_collect_experiment_rows_error_is_isolated(tmp_path):
+    """A parser error on one experiment must not affect others."""
+    manifest = ulb.Manifest(
+        experiments=[
+            ulb.ManifestExperiment(
+                id="E1", display_name="E1 bad", phase="phase2",
+                exp_type=ulb.ExperimentType.MULTITASK_SFT,
+                config="configs/sft_full_ft.yaml",
+                output_dir=str(FIXTURES / "outputs" / "e1_malformed_json"),
+                description="test", innovation=None,
+            ),
+            ulb.ManifestExperiment(
+                id="E2", display_name="E2 good", phase="phase2",
+                exp_type=ulb.ExperimentType.MULTITASK_SFT,
+                config="configs/sft_head_only.yaml",
+                output_dir=str(FIXTURES / "outputs" / "e1_complete"),
+                description="test", innovation=None,
+            ),
+        ],
+        diseases=CANONICAL_DISEASES,
+    )
+    rows = ulb.collect_experiment_rows(manifest, repo_root=tmp_path)
+    assert len(rows) == 2
+    assert rows[0].status == ulb.ExperimentStatus.ERROR
+    assert rows[0].error_message is not None
+    assert rows[1].status == ulb.ExperimentStatus.COMPLETED
+
+
+def test_collect_experiment_rows_resolves_relative_paths(tmp_path):
+    """Output_dir relative paths are resolved against repo_root."""
+    # Copy a fixture to a relative location under tmp_path
+    import shutil
+    relative_target = tmp_path / "outputs" / "E0_test"
+    relative_target.parent.mkdir(parents=True)
+    shutil.copytree(FIXTURES / "outputs" / "e0_complete", relative_target)
+
+    manifest = ulb.Manifest(
+        experiments=[
+            ulb.ManifestExperiment(
+                id="E0", display_name="E0 test", phase="phase1",
+                exp_type=ulb.ExperimentType.PER_DISEASE_SFT,
+                config="configs/reproduce.yaml",
+                output_dir="outputs/E0_test",  # RELATIVE path
+                description="test", innovation=None,
+            ),
+        ],
+        diseases=CANONICAL_DISEASES,
+    )
+    rows = ulb.collect_experiment_rows(manifest, repo_root=tmp_path)
+    assert rows[0].status == ulb.ExperimentStatus.COMPLETED

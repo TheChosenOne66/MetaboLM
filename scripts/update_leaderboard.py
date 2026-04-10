@@ -399,6 +399,81 @@ def parse_multitask(
     }
 
 
+# ── Collection / dispatch ─────────────────────────────────────────────────
+
+# Map experiment type → parser function
+_PARSERS = {
+    ExperimentType.PER_DISEASE_SFT: parse_per_disease_sft,
+    ExperimentType.MULTITASK_SFT: parse_multitask,
+    ExperimentType.MULTITASK_RL: parse_multitask,
+}
+
+
+def collect_experiment_rows(
+    manifest: Manifest, repo_root: Path
+) -> list[ExperimentRow]:
+    """Dispatch each manifest entry to its parser and build ExperimentRows."""
+    repo_root = Path(repo_root)
+    rows: list[ExperimentRow] = []
+
+    for entry in manifest.experiments:
+        # Resolve output_dir relative to repo_root if it's not absolute
+        out_path = Path(entry.output_dir)
+        if not out_path.is_absolute():
+            out_path = repo_root / out_path
+
+        parser = _PARSERS[entry.exp_type]
+        try:
+            parsed = parser(out_path, manifest.diseases)
+        except Exception as e:
+            # Defensive: parsers should NEVER raise, but belt-and-suspenders.
+            print(
+                f"[ERROR] {entry.id} parser raised unexpectedly: {e}",
+                file=sys.stderr,
+            )
+            parsed = {
+                "status": ExperimentStatus.ERROR,
+                "mean_auroc": None,
+                "mean_auprc": None,
+                "hierarchy_violation_rate": None,
+                "per_disease_auroc": {},
+                "per_disease_auprc": {},
+                "trainable_params": None,
+                "total_params": None,
+                "freeze_strategy": None,
+                "best_epoch": None,
+                "num_completed_diseases": None,
+                "error_message": f"Unexpected exception: {e}",
+            }
+
+        row = ExperimentRow(
+            id=entry.id,
+            display_name=entry.display_name,
+            phase=entry.phase,
+            exp_type=entry.exp_type,
+            config=entry.config,
+            output_dir=entry.output_dir,
+            description=entry.description,
+            innovation=entry.innovation,
+            status=parsed["status"],
+            mean_auroc=parsed["mean_auroc"],
+            mean_auprc=parsed["mean_auprc"],
+            hierarchy_violation_rate=parsed.get("hierarchy_violation_rate"),
+            trainable_params=parsed["trainable_params"],
+            total_params=parsed["total_params"],
+            freeze_strategy=parsed["freeze_strategy"],
+            best_epoch=parsed["best_epoch"],
+            per_disease_auroc=parsed["per_disease_auroc"],
+            per_disease_auprc=parsed["per_disease_auprc"],
+            num_completed_diseases=parsed["num_completed_diseases"],
+            total_diseases=len(manifest.diseases),
+            error_message=parsed["error_message"],
+        )
+        rows.append(row)
+
+    return rows
+
+
 def main() -> int:
     """CLI entry point. Returns exit code."""
     raise NotImplementedError("main() implemented in Task 9")
