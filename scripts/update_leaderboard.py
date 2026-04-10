@@ -194,6 +194,7 @@ def parse_per_disease_sft(
         "status": ExperimentStatus.PLANNED,
         "mean_auroc": None,
         "mean_auprc": None,
+        "hierarchy_violation_rate": None,
         "per_disease_auroc": {},
         "per_disease_auprc": {},
         "trainable_params": None,
@@ -266,6 +267,7 @@ def parse_per_disease_sft(
         "status": status,
         "mean_auroc": mean_auroc,
         "mean_auprc": None,  # E0 CSV has no AUPRC
+        "hierarchy_violation_rate": None,
         "per_disease_auroc": per_disease_auroc,
         "per_disease_auprc": {},
         "trainable_params": None,  # E0 hardcoded size, not in CSV
@@ -458,7 +460,7 @@ def collect_experiment_rows(
             status=parsed["status"],
             mean_auroc=parsed["mean_auroc"],
             mean_auprc=parsed["mean_auprc"],
-            hierarchy_violation_rate=parsed.get("hierarchy_violation_rate"),
+            hierarchy_violation_rate=parsed["hierarchy_violation_rate"],
             trainable_params=parsed["trainable_params"],
             total_params=parsed["total_params"],
             freeze_strategy=parsed["freeze_strategy"],
