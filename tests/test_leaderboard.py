@@ -49,3 +49,50 @@ def test_experiment_row_defaults():
     assert row.mean_auroc is None
     assert row.per_disease_auroc == {}
     assert row.total_diseases == 16
+
+
+# ── ManifestLoader tests ────────────────────────────────────────────────
+
+def test_manifest_loader_valid():
+    manifest = ulb.load_manifest(FIXTURES / "manifest_valid.yaml")
+    assert len(manifest.experiments) == 2
+    assert manifest.experiments[0].id == "E0"
+    assert manifest.experiments[0].exp_type == ulb.ExperimentType.PER_DISEASE_SFT
+    assert manifest.experiments[1].id == "E1"
+    assert manifest.experiments[1].exp_type == ulb.ExperimentType.MULTITASK_SFT
+    assert len(manifest.diseases) == 16
+    assert manifest.diseases[0] == "T2D"
+    assert manifest.diseases[-1] == "prostate_cancer"
+
+
+def test_manifest_loader_malformed_exits(capsys):
+    import pytest
+    with pytest.raises(SystemExit) as exc:
+        ulb.load_manifest(FIXTURES / "manifest_malformed.yaml")
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "manifest" in err.lower()
+
+
+def test_manifest_loader_missing_file_exits(capsys):
+    import pytest
+    with pytest.raises(SystemExit) as exc:
+        ulb.load_manifest(FIXTURES / "nonexistent.yaml")
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "not found" in err.lower() or "no such" in err.lower()
+
+
+def test_manifest_loader_rejects_missing_required_field(tmp_path):
+    import pytest
+    bad = tmp_path / "bad_manifest.yaml"
+    bad.write_text("""
+experiments:
+  - id: E0
+    # missing display_name, phase, type, etc.
+diseases:
+  - T2D
+""")
+    with pytest.raises(SystemExit) as exc:
+        ulb.load_manifest(bad)
+    assert exc.value.code == 1

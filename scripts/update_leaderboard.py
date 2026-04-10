@@ -78,6 +78,105 @@ class ExperimentRow:
     error_message: str | None = None
 
 
+# ── Manifest loading ──────────────────────────────────────────────────────
+
+REQUIRED_EXPERIMENT_FIELDS = (
+    "id", "display_name", "phase", "type", "config", "output_dir", "description",
+)
+
+
+@dataclass
+class ManifestExperiment:
+    """One entry from the manifest YAML."""
+    id: str
+    display_name: str
+    phase: str
+    exp_type: ExperimentType
+    config: str
+    output_dir: str
+    description: str
+    innovation: str | None
+
+
+@dataclass
+class Manifest:
+    experiments: list[ManifestExperiment]
+    diseases: list[str]
+
+
+def load_manifest(path: Path) -> Manifest:
+    """Load and validate manifest YAML. Exit 1 on any failure."""
+    path = Path(path)
+    if not path.exists():
+        print(f"ERROR: manifest file not found: {path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        with open(path, "r") as f:
+            raw = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        print(f"ERROR: failed to parse manifest YAML: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not isinstance(raw, dict):
+        print(f"ERROR: manifest root must be a mapping, got {type(raw).__name__}", file=sys.stderr)
+        sys.exit(1)
+
+    if "experiments" not in raw or "diseases" not in raw:
+        print(
+            "ERROR: manifest must contain 'experiments' and 'diseases' keys",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    experiments: list[ManifestExperiment] = []
+    for i, entry in enumerate(raw["experiments"]):
+        if not isinstance(entry, dict):
+            print(
+                f"ERROR: experiment #{i} must be a mapping, got {type(entry).__name__}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        missing = [f for f in REQUIRED_EXPERIMENT_FIELDS if f not in entry]
+        if missing:
+            print(
+                f"ERROR: experiment #{i} (id={entry.get('id', '?')}) missing required fields: {missing}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        try:
+            exp_type = ExperimentType(entry["type"])
+        except ValueError:
+            print(
+                f"ERROR: experiment {entry['id']} has invalid type '{entry['type']}'. "
+                f"Must be one of: {[t.value for t in ExperimentType]}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        experiments.append(
+            ManifestExperiment(
+                id=entry["id"],
+                display_name=entry["display_name"],
+                phase=entry["phase"],
+                exp_type=exp_type,
+                config=entry["config"],
+                output_dir=entry["output_dir"],
+                description=entry["description"],
+                innovation=entry.get("innovation"),
+            )
+        )
+
+    diseases = raw["diseases"]
+    if not isinstance(diseases, list) or not all(isinstance(d, str) for d in diseases):
+        print("ERROR: manifest 'diseases' must be a list of strings", file=sys.stderr)
+        sys.exit(1)
+
+    return Manifest(experiments=experiments, diseases=list(diseases))
+
+
 def main() -> int:
     """CLI entry point. Returns exit code."""
     raise NotImplementedError("main() implemented in Task 9")
