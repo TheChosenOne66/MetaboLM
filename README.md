@@ -132,15 +132,49 @@ metabolm_posttrain/
 
 ### 环境准备
 
+要求 **Python ≥ 3.10**（代码用了 `list[str]` / `X | None` 等 PEP 604 语法）+ CUDA GPU（训练需要，测试不需要）。
+
 ```bash
+conda create -n metabolm python=3.10 -y
 conda activate metabolm
 cd /path/to/metabolm_posttrain
 pip install -r requirements.txt
 ```
 
-依赖：torch>=2.4.0, numpy>=1.26, pandas>=2.2, scikit-learn>=1.4, scipy>=1.13, pyyaml>=6.0, tqdm, transformers
+依赖：torch>=2.4.0, transformers>=4.30.0, numpy>=1.26, pandas>=2.2, scikit-learn>=1.4, scipy>=1.13, miceforest>=5.6, pyyaml>=6.0, tqdm, pytest>=7.0
 
-### 1. 下载预训练权重
+### 从另一台机器迁移（推荐，1.7 GB bundle）
+
+`git clone` 完之后需要补齐两类大文件，它们不在 git 里（合计 ~1.7 GB）：
+
+| 文件 | 大小 | 用途 |
+|---|---|---|
+| `weights/best_metabolite_bert_model.pt` | 326 MB | 预训练 backbone，E0-E6 全部必需 |
+| `data/processed/train.csv` | 1.1 GB | 预处理后的训练数据（338K 人 × 168 代谢物 × 16 标签） |
+| `data/processed/val.csv` | 283 MB | 预处理后的验证数据（84K 人） |
+
+最快的办法是从已跑通的机器打包、下载、上传、解压：
+
+```bash
+# 在已跑通的机器上打包
+cd /path/to/metabolm_posttrain
+zip -r ~/metabolm_bundle.zip \
+    weights/best_metabolite_bert_model.pt \
+    data/processed/train.csv \
+    data/processed/val.csv
+sha256sum ~/metabolm_bundle.zip  # 记下 checksum
+
+# 下载到本地 → 上传到新机器 → 解压
+cd /path/to/metabolm_posttrain
+unzip /path/to/metabolm_bundle.zip
+# 文件会落到 weights/ 和 data/processed/ 对应位置
+
+# 验证
+python -m pytest tests/ -q            # 98 个测试全部通过
+ls -lh weights/ data/processed/       # 确认文件大小
+```
+
+### 1. 下载预训练权重（首次搭建时，没有 bundle）
 
 ```bash
 bash scripts/download_weights.sh

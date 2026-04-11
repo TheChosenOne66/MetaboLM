@@ -1,5 +1,3 @@
-import sys
-sys.path.insert(0, "/SPXvePFS/users/jytang/metabolm_posttrain")
 from src.data.endpoints import (
     DISEASE_ENDPOINTS, get_disease_names, get_unique_chapters,
     get_chapter_to_diseases, get_disease_to_chapter_idx, get_all_icd10_codes

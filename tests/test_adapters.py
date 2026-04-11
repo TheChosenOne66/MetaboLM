@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
-import sys
-sys.path.insert(0, "/SPXvePFS/users/jytang/metabolm_posttrain")
+
 from src.model.adapters import AdapterLayer, LoRALinear
 
 

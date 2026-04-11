@@ -1,6 +1,5 @@
 import torch
-import sys
-sys.path.insert(0, "/SPXvePFS/users/jytang/metabolm_posttrain")
+
 from src.model.backbone import MetaboliteBERTModel
 
 

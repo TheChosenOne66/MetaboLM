@@ -1,5 +1,8 @@
 """Tests for NMR biomarker selection (168 fields)."""
 
+import os
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
@@ -10,6 +13,18 @@ from src.data.biomarkers import (
     get_field_ids,
     get_metabolite_names,
     select_biomarkers,
+)
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Raw UK Biobank metabolomics CSV is external to the repo. Set
+# UKB_METABOLOMICS_CSV env var to point to your copy; otherwise the default
+# below is used (works on the machine where the repo was developed). The
+# fixture below intentionally crashes with FileNotFoundError if the path is
+# not accessible — data-missing is never silent.
+RAW_METABOLOMICS_CSV = os.environ.get(
+    "UKB_METABOLOMICS_CSV",
+    "/SPXvePFS/users/jytang/storage_tmp/metabolomics.csv",
 )
 
 
@@ -87,7 +102,7 @@ def test_names_match_correlation_matrix():
     """Metabolite names must exactly match the correlation-matrix columns."""
     import csv
 
-    csv_path = "/SPXvePFS/users/jytang/metabolm_posttrain/_reference_correlation_matrix.csv"
+    csv_path = REPO_ROOT / "_reference_correlation_matrix.csv"
     with open(csv_path, "r", encoding="utf-8-sig") as f:
         reader = csv.reader(f)
         header = next(reader)
@@ -103,11 +118,13 @@ def test_names_match_correlation_matrix():
 
 @pytest.fixture(scope="module")
 def raw_metabolomics_df() -> pd.DataFrame:
-    """Load first 10 rows of the raw UKB metabolomics CSV."""
-    return pd.read_csv(
-        "/SPXvePFS/users/jytang/storage_tmp/metabolomics.csv",
-        nrows=10,
-    )
+    """Load first 10 rows of the raw UKB metabolomics CSV.
+
+    Crashes with FileNotFoundError if ``RAW_METABOLOMICS_CSV`` does not
+    exist. Override via ``UKB_METABOLOMICS_CSV`` env var on machines where
+    the default path is not available.
+    """
+    return pd.read_csv(RAW_METABOLOMICS_CSV, nrows=10)
 
 
 def test_select_biomarkers_shape(raw_metabolomics_df: pd.DataFrame):
