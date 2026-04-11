@@ -467,12 +467,14 @@ experiments:
 diseases:{_SIXTEEN_DISEASES_YAML}
 """)
     output_path = tmp_path / "LEADERBOARD.md"
+    readme_path = tmp_path / "README.md"  # isolate from real README
     monkeypatch.setattr(
         sys, "argv",
         [
             "update_leaderboard.py",
             "--manifest", str(manifest_path),
             "--output", str(output_path),
+            "--readme", str(readme_path),
             "--repo-root", str(tmp_path),
         ],
     )
@@ -493,12 +495,14 @@ diseases:
   - T2D
 """)
     output_path = tmp_path / "LEADERBOARD.md"
+    readme_path = tmp_path / "README.md"  # isolate from real README
     monkeypatch.setattr(
         sys, "argv",
         [
             "update_leaderboard.py",
             "--manifest", str(manifest_path),
             "--output", str(output_path),
+            "--readme", str(readme_path),
             "--repo-root", str(tmp_path),
         ],
     )
@@ -528,12 +532,14 @@ experiments:
 diseases:{_SIXTEEN_DISEASES_YAML}
 """)
     output_path = tmp_path / "LEADERBOARD.md"
+    readme_path = tmp_path / "README.md"  # isolate from real README
     monkeypatch.setattr(
         sys, "argv",
         [
             "update_leaderboard.py",
             "--manifest", str(manifest_path),
             "--output", str(output_path),
+            "--readme", str(readme_path),
             "--repo-root", str(tmp_path),
         ],
     )
@@ -541,3 +547,204 @@ diseases:{_SIXTEEN_DISEASES_YAML}
     assert exit_code == 2
     assert output_path.exists()  # file still written
     assert "❌" in output_path.read_text()
+
+
+# ── render_readme_section tests ─────────────────────────────────────────
+
+def test_render_readme_section_has_summary_table():
+    """Readme section must contain a summary row for every experiment."""
+    rows = [_make_planned_row("E0"), _make_planned_row("E1")]
+    section = ulb.render_readme_section(rows, CANONICAL_DISEASES)
+    assert "Summary" in section
+    assert "| E0 |" in section
+    assert "| E1 |" in section
+
+
+def test_render_readme_section_has_per_disease_table():
+    """Readme section must contain the per-disease AUROC table."""
+    rows = [_make_planned_row("E0")]
+    section = ulb.render_readme_section(rows, CANONICAL_DISEASES)
+    assert "Per-Disease AUROC" in section
+    # every disease must appear as a row label
+    for disease in CANONICAL_DISEASES:
+        assert f"| {disease} |" in section
+    # MEAN row must be present
+    assert "**MEAN**" in section
+
+
+def test_render_readme_section_omits_experiment_details():
+    """Experiment Details section belongs in LEADERBOARD.md, not README."""
+    rows = [_make_planned_row("E0")]
+    section = ulb.render_readme_section(rows, CANONICAL_DISEASES)
+    assert "Experiment Details" not in section
+
+
+def test_render_readme_section_uses_h3_subheadings():
+    """README already uses ## for top-level sections; keep leaderboard at ###."""
+    rows = [_make_planned_row("E0")]
+    section = ulb.render_readme_section(rows, CANONICAL_DISEASES)
+    # Top-level title (#) must not appear — that's the README's job
+    assert "# MetaboLM Post-Training — Experiment Leaderboard" not in section
+    # Must use ### for subsections, not ## — check line-by-line to avoid
+    # the substring false-positive where "## Summary" ⊂ "### Summary".
+    section_lines = section.splitlines()
+    assert "### Summary" in section_lines
+    assert "### Per-Disease AUROC" in section_lines
+    assert "## Summary" not in section_lines
+    assert "## Per-Disease AUROC" not in section_lines
+
+
+def test_render_readme_section_has_timestamp():
+    """Helps user trust the data is fresh."""
+    rows = [_make_planned_row("E0")]
+    section = ulb.render_readme_section(rows, CANONICAL_DISEASES)
+    assert "Last updated" in section
+
+
+# ── inject_into_readme tests ────────────────────────────────────────────
+
+def test_inject_into_readme_replaces_content_between_markers(tmp_path):
+    """Marker-delimited region is replaced; surrounding text is preserved."""
+    readme = tmp_path / "README.md"
+    readme.write_text(
+        "# My Project\n"
+        "\n"
+        "Some prose.\n"
+        "\n"
+        "<!-- LEADERBOARD:START -->\n"
+        "OLD CONTENT\n"
+        "<!-- LEADERBOARD:END -->\n"
+        "\n"
+        "More prose.\n"
+    )
+    result = ulb.inject_into_readme(readme, "NEW CONTENT")
+    assert result is True
+    content = readme.read_text()
+    assert "NEW CONTENT" in content
+    assert "OLD CONTENT" not in content
+    # Surrounding text preserved
+    assert "# My Project" in content
+    assert "Some prose." in content
+    assert "More prose." in content
+    # Markers themselves preserved
+    assert "<!-- LEADERBOARD:START -->" in content
+    assert "<!-- LEADERBOARD:END -->" in content
+
+
+def test_inject_into_readme_returns_false_without_markers(tmp_path):
+    """README without markers is left untouched and function returns False."""
+    readme = tmp_path / "README.md"
+    original = "# My Project\n\nNo markers here.\n"
+    readme.write_text(original)
+    result = ulb.inject_into_readme(readme, "NEW CONTENT")
+    assert result is False
+    assert readme.read_text() == original
+
+
+def test_inject_into_readme_returns_false_if_file_missing(tmp_path):
+    """Missing README is not an error."""
+    readme = tmp_path / "does_not_exist.md"
+    result = ulb.inject_into_readme(readme, "NEW CONTENT")
+    assert result is False
+    assert not readme.exists()
+
+
+def test_inject_into_readme_is_idempotent(tmp_path):
+    """Running twice with same content must not duplicate or corrupt the file."""
+    readme = tmp_path / "README.md"
+    readme.write_text(
+        "before\n"
+        "<!-- LEADERBOARD:START -->\n"
+        "old\n"
+        "<!-- LEADERBOARD:END -->\n"
+        "after\n"
+    )
+    ulb.inject_into_readme(readme, "injected")
+    first = readme.read_text()
+    ulb.inject_into_readme(readme, "injected")
+    second = readme.read_text()
+    assert first == second
+    # Only one occurrence of the markers
+    assert first.count("<!-- LEADERBOARD:START -->") == 1
+    assert first.count("<!-- LEADERBOARD:END -->") == 1
+
+
+# ── main() + README injection ───────────────────────────────────────────
+
+def test_main_injects_into_readme(tmp_path, monkeypatch):
+    """End-to-end: main() with --readme flag updates the README in place."""
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(f"""
+experiments:
+  - id: E0
+    display_name: "E0 Test"
+    phase: phase1
+    type: per_disease_sft
+    config: configs/reproduce.yaml
+    output_dir: outputs/does_not_exist
+    description: "Test"
+    innovation: null
+diseases:{_SIXTEEN_DISEASES_YAML}
+""")
+    readme_path = tmp_path / "README.md"
+    readme_path.write_text(
+        "# Project\n"
+        "\n"
+        "Intro text.\n"
+        "\n"
+        "<!-- LEADERBOARD:START -->\n"
+        "stale\n"
+        "<!-- LEADERBOARD:END -->\n"
+        "\n"
+        "Outro text.\n"
+    )
+    output_path = tmp_path / "LEADERBOARD.md"
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "update_leaderboard.py",
+            "--manifest", str(manifest_path),
+            "--output", str(output_path),
+            "--readme", str(readme_path),
+            "--repo-root", str(tmp_path),
+        ],
+    )
+    exit_code = ulb.main()
+    assert exit_code == 0
+    readme_content = readme_path.read_text()
+    # Stale content is gone
+    assert "stale" not in readme_content
+    # Summary table injected
+    assert "E0 Test" in readme_content
+    assert "### Summary" in readme_content
+    # Surrounding README text untouched
+    assert "# Project" in readme_content
+    assert "Intro text." in readme_content
+    assert "Outro text." in readme_content
+
+
+def test_main_readme_missing_markers_is_not_an_error(tmp_path, monkeypatch):
+    """If README lacks markers, main() succeeds (exit 0) without modifying it."""
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text("""
+experiments: []
+diseases:
+  - T2D
+""")
+    readme_path = tmp_path / "README.md"
+    original = "# Project\n\nNo markers.\n"
+    readme_path.write_text(original)
+    output_path = tmp_path / "LEADERBOARD.md"
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "update_leaderboard.py",
+            "--manifest", str(manifest_path),
+            "--output", str(output_path),
+            "--readme", str(readme_path),
+            "--repo-root", str(tmp_path),
+        ],
+    )
+    exit_code = ulb.main()
+    assert exit_code == 0
+    assert readme_path.read_text() == original
