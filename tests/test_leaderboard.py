@@ -427,3 +427,117 @@ def test_render_error_row():
     )
     md = ulb.render_markdown([row], CANONICAL_DISEASES)
     assert "❌" in md
+
+
+# ── main() end-to-end tests ──────────────────────────────────────────────
+
+_SIXTEEN_DISEASES_YAML = """
+  - T2D
+  - obesity
+  - hypertension
+  - ischemic_heart
+  - atrial_fib
+  - heart_failure
+  - rheumatoid
+  - asthma
+  - dementia
+  - copd
+  - stroke
+  - parkinsons
+  - breast_cancer
+  - colon_cancer
+  - lung_cancer
+  - prostate_cancer
+"""
+
+
+def test_main_writes_leaderboard_file(tmp_path, monkeypatch, capsys):
+    """Smoke test: given a valid manifest + empty outputs dir, main writes a file."""
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(f"""
+experiments:
+  - id: E0
+    display_name: "E0 Test"
+    phase: phase1
+    type: per_disease_sft
+    config: configs/reproduce.yaml
+    output_dir: outputs/does_not_exist
+    description: "Test"
+    innovation: null
+diseases:{_SIXTEEN_DISEASES_YAML}
+""")
+    output_path = tmp_path / "LEADERBOARD.md"
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "update_leaderboard.py",
+            "--manifest", str(manifest_path),
+            "--output", str(output_path),
+            "--repo-root", str(tmp_path),
+        ],
+    )
+    exit_code = ulb.main()
+    assert exit_code == 0
+    assert output_path.exists()
+    content = output_path.read_text()
+    assert "E0 Test" in content
+    assert "⬜" in content  # planned icon
+
+
+def test_main_exit_code_0_on_success(tmp_path, monkeypatch):
+    """Purely PLANNED state should exit 0, not 2."""
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text("""
+experiments: []
+diseases:
+  - T2D
+""")
+    output_path = tmp_path / "LEADERBOARD.md"
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "update_leaderboard.py",
+            "--manifest", str(manifest_path),
+            "--output", str(output_path),
+            "--repo-root", str(tmp_path),
+        ],
+    )
+    exit_code = ulb.main()
+    assert exit_code == 0
+
+
+def test_main_exit_code_2_on_parser_error(tmp_path, monkeypatch):
+    """A parser error should cause exit code 2 but still write the file."""
+    import shutil
+    shutil.copytree(
+        FIXTURES / "outputs" / "e1_malformed_json",
+        tmp_path / "outputs" / "e1_bad",
+    )
+
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(f"""
+experiments:
+  - id: E1
+    display_name: "E1 Bad"
+    phase: phase2
+    type: multitask_sft
+    config: configs/sft_full_ft.yaml
+    output_dir: outputs/e1_bad
+    description: "Test"
+    innovation: null
+diseases:{_SIXTEEN_DISEASES_YAML}
+""")
+    output_path = tmp_path / "LEADERBOARD.md"
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "update_leaderboard.py",
+            "--manifest", str(manifest_path),
+            "--output", str(output_path),
+            "--repo-root", str(tmp_path),
+        ],
+    )
+    exit_code = ulb.main()
+    assert exit_code == 2
+    assert output_path.exists()  # file still written
+    assert "❌" in output_path.read_text()

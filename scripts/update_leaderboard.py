@@ -628,8 +628,63 @@ def render_markdown(rows: list[ExperimentRow], diseases: list[str]) -> str:
 
 
 def main() -> int:
-    """CLI entry point. Returns exit code."""
-    raise NotImplementedError("main() implemented in Task 9")
+    """CLI entry point. Returns exit code.
+
+    Exit codes:
+        0 — success (includes all-planned and partial states).
+        1 — manifest load failure (raised from load_manifest via sys.exit(1)).
+        2 — at least one experiment parser produced an ERROR status.
+            The LEADERBOARD.md file is still written in this case.
+    """
+    parser = argparse.ArgumentParser(
+        description="Generate LEADERBOARD.md from experiment outputs."
+    )
+    parser.add_argument(
+        "--manifest",
+        default=str(REPO_ROOT / "configs" / "leaderboard_manifest.yaml"),
+        help="Path to manifest YAML (default: configs/leaderboard_manifest.yaml)",
+    )
+    parser.add_argument(
+        "--output",
+        default=str(REPO_ROOT / "LEADERBOARD.md"),
+        help="Path to output markdown file (default: LEADERBOARD.md)",
+    )
+    parser.add_argument(
+        "--repo-root",
+        default=str(REPO_ROOT),
+        help="Repo root for resolving relative output_dir paths (default: auto-detect)",
+    )
+    args = parser.parse_args()
+
+    manifest = load_manifest(Path(args.manifest))
+    rows = collect_experiment_rows(manifest, repo_root=Path(args.repo_root))
+
+    markdown = render_markdown(rows, manifest.diseases)
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(markdown)
+
+    # Summary line to stdout
+    counts: dict[ExperimentStatus, int] = {s: 0 for s in ExperimentStatus}
+    for row in rows:
+        counts[row.status] += 1
+
+    parts = []
+    if counts[ExperimentStatus.COMPLETED]:
+        parts.append(f"{counts[ExperimentStatus.COMPLETED]} done")
+    if counts[ExperimentStatus.PARTIAL]:
+        parts.append(f"{counts[ExperimentStatus.PARTIAL]} partial")
+    if counts[ExperimentStatus.PLANNED]:
+        parts.append(f"{counts[ExperimentStatus.PLANNED]} planned")
+    if counts[ExperimentStatus.ERROR]:
+        parts.append(f"{counts[ExperimentStatus.ERROR]} error")
+    summary_str = ", ".join(parts) if parts else "no experiments"
+    print(f"Leaderboard updated: {len(rows)} experiments ({summary_str})")
+
+    # Exit code 2 if any parser produced an error
+    if counts[ExperimentStatus.ERROR] > 0:
+        return 2
+    return 0
 
 
 if __name__ == "__main__":
