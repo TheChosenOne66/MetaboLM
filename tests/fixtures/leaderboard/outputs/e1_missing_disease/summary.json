@@ -1,0 +1,8 @@
+{
+  "experiment": "E1_missing",
+  "freeze_strategy": "none",
+  "best_epoch": 25,
+  "best_mean_auc": 0.7900,
+  "trainable_params": 85123456,
+  "total_params": 85123456
+}

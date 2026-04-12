@@ -1,0 +1,17 @@
+Disease,Val_AUC,Val_F1
+T2D,0.850,0.310
+obesity,0.750,0.270
+hypertension,0.790,0.300
+ischemic_heart,0.830,0.280
+atrial_fib,0.790,0.260
+heart_failure,0.850,0.320
+rheumatoid,0.740,0.210
+asthma,0.730,0.250
+dementia,0.890,0.340
+copd,0.870,0.330
+stroke,0.780,0.270
+parkinsons,0.820,0.290
+breast_cancer,0.710,0.200
+colon_cancer,0.680,0.190
+lung_cancer,0.860,0.350
+MEAN,0.7893,0.2780

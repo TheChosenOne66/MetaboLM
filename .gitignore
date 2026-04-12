@@ -1,0 +1,38 @@
+# Model weights and large files
+weights/
+best_metabolite_bert_model.pt.zip
+outputs/
+!tests/fixtures/**/outputs/
+!tests/fixtures/**/outputs/**
+
+# Large data files
+data/processed/train.csv
+data/processed/val.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Nebula runtime
+cluster.json
+do.sh
+entry.py
+nebula_task.json
