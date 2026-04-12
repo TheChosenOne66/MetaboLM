@@ -20,7 +20,7 @@ experiments:
     phase: phase2
     type: multitask_sft
     config: configs/sft_full_ft.yaml
-    output_dir: outputs/E1_full_ft
+    output_dir: outputs/E1_sft_full_ft
     description: "Joint 16 diseases + 6 ICD-10 chapters, full fine-tuning"
     innovation: "Innovation 1 + 2: hierarchical structure + hierarchy loss"
 
