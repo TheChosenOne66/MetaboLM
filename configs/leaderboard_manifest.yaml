@@ -29,7 +29,7 @@ experiments:
     phase: phase2
     type: multitask_sft
     config: configs/sft_head_only.yaml
-    output_dir: outputs/E2_head_only
+    output_dir: outputs/E2_sft_head_only
     description: "Freeze backbone, train only classification heads"
     innovation: "Innovation 3: PEFT — head only (~0.24%)"
 
@@ -38,7 +38,7 @@ experiments:
     phase: phase2
     type: multitask_sft
     config: configs/sft_adapter.yaml
-    output_dir: outputs/E3_adapter
+    output_dir: outputs/E3_sft_adapter
     description: "Freeze backbone + 12-layer adapters (768->64->768)"
     innovation: "Innovation 3: PEFT — adapter (~1.61%)"
 
@@ -47,7 +47,7 @@ experiments:
     phase: phase2
     type: multitask_sft
     config: configs/sft_lora.yaml
-    output_dir: outputs/E4_lora
+    output_dir: outputs/E4_sft_lora
     description: "Freeze backbone + LoRA rank-8 on Q/V projections"
     innovation: "Innovation 3: PEFT — LoRA (~0.58%)"
 
