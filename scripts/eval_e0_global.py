@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Evaluate E0 per-disease checkpoints on the global val.csv.
+"""Evaluate E0 per-disease checkpoints on the global val.csv — shared preprocessing.
 
-This enables fair comparison with E1-E4 (which are evaluated on the same
-global val set).  E0's original metrics were computed on per-disease
-balanced subsets with "super-healthy" negatives, making AUROC artificially
-easier.  This script re-evaluates each E0 model on the full population.
+This variant feeds each E0 checkpoint the same globally z-scored ``val.csv``
+that E1-E4 consume at evaluation time, i.e. only the normalisation produced
+by ``scripts/prepare_data.py`` is applied. The per-disease cohort z-score
+that ``scripts/train.py:build_disease_cohort`` fits during training is
+intentionally *not* replayed here. The resulting numbers therefore measure
+how E0 behaves when forced into the unified E1-E4 preprocessing pipeline
+(i.e. under inference-time distribution shift relative to training).
+
+For E0 evaluated under its own trained preprocessing (per-disease cohort
+z-score replayed on ``val.csv``), see ``scripts/eval_e0_global_cohort.py``.
 
 Usage::
 
@@ -75,11 +81,34 @@ def load_val_data(val_path: str) -> tuple[np.ndarray, np.ndarray, list[str]]:
 
 
 def load_correlation_matrix(cfg, device: torch.device) -> torch.Tensor:
-    """Load padded correlation matrix."""
+    """Load padded correlation matrix (169x169).
+
+    Mirrors scripts/train.py:load_correlation_matrix — prefers the prebuilt
+    ``.pt`` under ``cfg.data.correlation_matrix_path`` and falls back to the
+    reference CSV when the ``.pt`` is unavailable, so this evaluator works in
+    the same environments the training path does.
+    """
+    import pandas as pd
+
     corr_path = Path(cfg.data.correlation_matrix_path)
     if corr_path.suffix == ".pt" and corr_path.exists():
         return torch.load(str(corr_path), map_location=device)
-    raise FileNotFoundError(f"Correlation matrix not found: {corr_path}")
+
+    csv_path = Path("_reference/Pre-training/metabolomic_correlation_matrix.csv")
+    if not csv_path.exists():
+        csv_path = Path("_reference_correlation_matrix.csv")
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            f"Correlation matrix not found at {corr_path} or fallback CSV paths "
+            f"(_reference/Pre-training/metabolomic_correlation_matrix.csv, "
+            f"_reference_correlation_matrix.csv)."
+        )
+
+    corr_df = pd.read_csv(str(csv_path), index_col=0, encoding="utf-8-sig")
+    bias_matrix = torch.tensor(corr_df.values, dtype=torch.float32, device=device)
+    # Pad with zeros for [CLS] token at position 0 (matches train path).
+    bias_matrix = torch.nn.functional.pad(bias_matrix, (1, 0, 1, 0), "constant", 0)
+    return bias_matrix
 
 
 @torch.no_grad()

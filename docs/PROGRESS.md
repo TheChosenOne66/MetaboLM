@@ -362,7 +362,22 @@
 
 E0 的负样本是"一个病都没有的超级健康人"（57%），而 E1-E4 的负样本还包含 43% 有其他疾病的共病人群——这些人的代谢物谱与目标疾病患者更相似，区分更难。
 
-**解决方案**: 新增 `scripts/eval_e0_global.py`，用 E0 训练好的 16 个 per-disease checkpoint 在全局 val.csv 上做推理并计算 AUROC，使 E0 与 E1-E4 在同一测试集上可比。
+**解决方案**: 新增两个 eval 脚本，分别对应两种"公平"定义：
+
+- **`scripts/eval_e0_global.py`（shared preprocessing / "部署一致"）**
+  每个 E0 checkpoint 在全局 val.csv 上推理，**只保留** `prepare_data.py` 的全局 z-score，不复现训练时的 per-disease cohort z-score。这对应"E0 被强行塞进统一部署 pipeline"的情景，和 E1-E4 的推理预处理完全一致。
+- **`scripts/eval_e0_global_cohort.py`（own pipeline / "各用各的训练预处理"）**
+  每个 E0 checkpoint 在全局 val.csv 上推理，但**复现**训练时的 per-disease cohort z-score（通过 `seed=42` 调用 `scripts/train.py:build_disease_cohort` 拿到 deterministic 的 cohort train eids，然后在全局 z-score 空间里重算 mean/std 套到 val.csv 上）。这对应"每个模型用它自己训练时的预处理"的标准 ML 公平性定义。
+
+两者同时报，可以把"测试集难度差异"和"预处理 distribution shift"分开归因：
+
+| 指标（T2D smoke test） | AUC | 解读 |
+|---|---|---|
+| E0 balanced subset（原论文风格）| 0.867 | E0 在自己最舒服设置下的能力上限 |
+| E0 global val + own preproc | 0.8546 | 真 apples-to-apples 可比的 E0 数字 |
+| E0 global val + shared preproc | 0.8313 | E0 被迫使用 E1-E4 部署 pipeline 时的退化 |
+
+→ 0.867 vs 0.8546 的 1.2 个点差距才是"测试集更难"带来的真实下降；0.8546 vs 0.8313 的 2.3 个点是"E0 依赖 per-disease 私有归一化"的部署代价。这两部分归因清晰后，**对 E1-E4 的主比较以 `eval_e0_global_cohort.py` 的数字为准**，而 shared-preproc 数字作为"E0 非通用性"的诊断证据保留。
 
 ---
 
@@ -388,7 +403,9 @@ E0 vs E1 差距仅 1.8 个点（0.698 vs 0.680），且受测试集差异影响�
 
 #### 下一步行动
 
-1. [x] 新增 `scripts/eval_e0_global.py`（已完成）
-2. [ ] 在 GPU 机器上运行 `eval_e0_global.py`，获取 E0 在全局 val 上的公平 AUROC
-3. [ ] 根据公平比较结果决定是否需要架构改进（去除 shared projection、调整 hierarchy loss 权重等）
-4. [ ] E5-E6 (GRPO RL) 执行或直接进入论文撰写
+1. [x] 新增 `scripts/eval_e0_global.py`（shared preprocessing）
+2. [x] 新增 `scripts/eval_e0_global_cohort.py`（own pipeline，per-disease z-score 复现）
+3. [x] T2D smoke test 通过（own=0.8546 / shared=0.8313）
+4. [ ] 拿齐 E0 其余 15 个 checkpoint 后，在两个脚本下跑完整 16 疾病
+5. [ ] 根据 own-preproc 主比较结果决定是否需要架构改进（去除 shared projection、调整 hierarchy loss 权重等）
+6. [ ] E5-E6 (GRPO RL) 执行或直接进入论文撰写
