@@ -539,10 +539,19 @@ def parse_global_eval_dir(
         diag = df[(df["ckpt_disease"] == disease) & (df["eval_label"] == disease)]
         if diag.empty:
             continue
+        val_auc = diag["Val_AUC"].iloc[0]
+        # Eval scripts write an empty ``Val_AUC`` cell when ``roc_auc_score``
+        # fails (e.g. single-class labels on the eval set). pandas loads the
+        # empty cell as ``NaN``, and ``float(NaN)`` silently returns ``NaN``
+        # instead of raising — so the ``except`` clause below is *not*
+        # sufficient on its own. Guard with ``pd.isna`` first, otherwise a
+        # NaN would slip into ``per_disease`` and poison the mean_auroc
+        # computed from it.
+        if pd.isna(val_auc):
+            continue
         try:
-            per_disease[disease] = float(diag["Val_AUC"].iloc[0])
+            per_disease[disease] = float(val_auc)
         except (ValueError, TypeError):
-            # Empty cell (e.g. NaN AUC sentinel from the eval script) — skip.
             continue
 
     mean_auroc = (
