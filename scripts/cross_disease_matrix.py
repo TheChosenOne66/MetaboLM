@@ -38,7 +38,6 @@ import argparse
 import csv
 import json
 import logging
-import math
 import sys
 from pathlib import Path
 
@@ -149,13 +148,13 @@ def build_matrix(
         auc_rows[ckpt_disease] = row
 
         diag = row[ckpt_disease]
-        diag_str = "NaN" if math.isnan(diag) else f"{diag:.4f}"
+        diag_str = "NaN" if pd.isna(diag) else f"{float(diag):.4f}"
         off_diag = [
-            v for k, v in row.items()
-            if k != ckpt_disease and not math.isnan(v)
+            float(v) for k, v in row.items()
+            if k != ckpt_disease and not pd.isna(v)
         ]
         off_mean = sum(off_diag) / len(off_diag) if off_diag else float("nan")
-        off_str = "NaN" if math.isnan(off_mean) else f"{off_mean:.4f}"
+        off_str = "NaN" if pd.isna(off_mean) else f"{off_mean:.4f}"
         logger.info("[%s] diagonal=%s, off-diagonal mean=%s (n=%d)",
                     ckpt_disease, diag_str, off_str, len(off_diag))
 
@@ -195,7 +194,7 @@ def write_outputs(
             for eval_label, auc in row.items():
                 writer.writerow([
                     ckpt_disease, eval_label,
-                    "" if math.isnan(auc) else f"{float(auc):.4f}",
+                    "" if pd.isna(auc) else f"{float(auc):.4f}",
                     int(ckpt_disease == eval_label),
                     n_pos_lookup.get(eval_label, ""),
                     n_total,
@@ -216,11 +215,12 @@ def write_outputs(
     for ckpt_disease, row in matrix.iterrows():
         diag = (
             float(row[ckpt_disease])
-            if ckpt_disease in row.index else float("nan")
+            if ckpt_disease in row.index and not pd.isna(row[ckpt_disease])
+            else float("nan")
         )
         off_vals = [
             float(v) for k, v in row.items()
-            if k != ckpt_disease and not (isinstance(v, float) and math.isnan(v))
+            if k != ckpt_disease and not pd.isna(v)
         ]
         summary["per_ckpt"][ckpt_disease] = {
             "diagonal_auc": _none_if_nan(diag),
@@ -234,16 +234,22 @@ def write_outputs(
 
 
 def _safe_mean(values: list[float]) -> float:
-    """Mean ignoring NaN; returns NaN on empty input."""
-    valid = [v for v in values if not (isinstance(v, float) and math.isnan(v))]
+    """Mean ignoring NaN; returns NaN on empty input.
+
+    Uses ``pd.isna`` rather than ``isinstance(v, float) and math.isnan(v)``
+    so that values coming off a pandas Series (which may be ``numpy.float64``
+    rather than a Python ``float``) are handled uniformly regardless of
+    numpy version.
+    """
+    valid = [float(v) for v in values if not pd.isna(v)]
     return sum(valid) / len(valid) if valid else float("nan")
 
 
 def _none_if_nan(value: float) -> float | None:
-    """Convert NaN to None so JSON output is clean."""
-    if isinstance(value, float) and math.isnan(value):
+    """Convert NaN to None so JSON output is clean (no literal ``NaN``)."""
+    if pd.isna(value):
         return None
-    return value
+    return float(value)
 
 
 def render_ascii_heatmap(matrix: pd.DataFrame) -> str:
@@ -254,11 +260,15 @@ def render_ascii_heatmap(matrix: pd.DataFrame) -> str:
     # Right-align ckpt names in the row label column
     name_w = max(len(c) for c in matrix.index)
 
-    # Two-character cells: AUC * 100 rounded, e.g. 0.854 -> "85"
-    def cell(v: float) -> str:
-        if isinstance(v, float) and math.isnan(v):
+    # Two-character cells: AUC * 100 rounded, e.g. 0.854 -> "85".
+    # ``pd.isna`` handles ``float('nan')``, ``numpy.float64('nan')``, ``None``
+    # and pandas-nullable scalars uniformly — ``isinstance(v, float)`` was
+    # brittle because ``numpy.float64`` only happens to subclass ``float`` on
+    # some numpy/platform combinations.
+    def cell(v) -> str:
+        if pd.isna(v):
             return " ·"
-        return f"{int(round(v * 100)):2d}"
+        return f"{int(round(float(v) * 100)):2d}"
 
     lines = []
     # Header: short label codes (first 4 chars or so)
