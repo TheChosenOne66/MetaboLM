@@ -832,11 +832,33 @@ def _format_status(row: ExperimentRow) -> str:
     return "?"
 
 
+def _row_has_cross_regime_eval(row: ExperimentRow) -> bool:
+    """True if ``row.mean_auroc`` comes from a different eval regime than
+    the rows the reader likely wants to compare it with.
+
+    A row declares extra ``eval_dirs`` in the manifest precisely because
+    its primary Mean AUROC is under a *different* evaluation regime (e.g.
+    E0's paper-style balanced per-disease subset) than the other rows
+    (e.g. E1-E4's global val.csv). In that case the Summary/Per-Disease
+    numbers are not directly comparable across rows, and we flag the
+    row's Mean with a ``†`` marker pointing to the Global-Val Diagnostics
+    section where the apples-to-apples numbers live.
+    """
+    if not row.eval_variant_per_disease_auroc:
+        return False
+    return any(
+        bool(v) for v in row.eval_variant_per_disease_auroc.values()
+    )
+
+
 def _format_mean_with_partial_warning(row: ExperimentRow) -> str:
     base = _format_float(row.mean_auroc)
+    suffix = ""
     if row.status == ExperimentStatus.PARTIAL and row.mean_auroc is not None:
-        return f"{base} ⚠️"
-    return base
+        suffix += " ⚠️"
+    if _row_has_cross_regime_eval(row) and row.mean_auroc is not None:
+        suffix += " †"
+    return base + suffix
 
 
 def render_markdown(rows: list[ExperimentRow], diseases: list[str]) -> str:
@@ -885,7 +907,9 @@ def render_markdown(rows: list[ExperimentRow], diseases: list[str]) -> str:
     lines.append("")
     lines.append(
         "**Legend**: ✅ Done · ⚡ Partial · ⬜ Planned · ❌ Error · "
-        "⚠️ = partial data, metric computed over completed diseases only"
+        "⚠️ = partial data, metric computed over completed diseases only · "
+        "† = primary Mean AUROC is from a different eval regime than other "
+        "rows — see *Global-Val Diagnostics* below for apples-to-apples numbers"
     )
     lines.append("")
 
@@ -904,10 +928,16 @@ def render_markdown(rows: list[ExperimentRow], diseases: list[str]) -> str:
             cells.append(_format_float(value))
         lines.append("| " + " | ".join(cells) + " |")
 
-    # MEAN row
+    # MEAN row — mark cross-regime rows with ``†`` here too: the per-disease
+    # cells and this Mean share the same eval regime as the Summary table
+    # above, so the same caveat applies.
     mean_cells = ["**MEAN**"]
     for row in rows:
-        mean_cells.append(f"**{_format_float(row.mean_auroc)}**")
+        marker = (
+            " †" if _row_has_cross_regime_eval(row) and row.mean_auroc is not None
+            else ""
+        )
+        mean_cells.append(f"**{_format_float(row.mean_auroc)}**{marker}")
     lines.append("| " + " | ".join(mean_cells) + " |")
     lines.append("")
 
@@ -994,7 +1024,9 @@ def render_readme_section(
     lines.append("")
     lines.append(
         "**Legend**: ✅ Done · ⚡ Partial · ⬜ Planned · ❌ Error · "
-        "⚠️ = partial data, metric computed over completed diseases only"
+        "⚠️ = partial data, metric computed over completed diseases only · "
+        "† = primary Mean AUROC is from a different eval regime than other "
+        "rows — see *Global-Val Diagnostics* below for apples-to-apples numbers"
     )
     lines.append("")
 
@@ -1013,9 +1045,14 @@ def render_readme_section(
             cells.append(_format_float(value))
         lines.append("| " + " | ".join(cells) + " |")
 
+    # Same ``†`` marker as LEADERBOARD.md's Per-Disease MEAN row.
     mean_cells = ["**MEAN**"]
     for row in rows:
-        mean_cells.append(f"**{_format_float(row.mean_auroc)}**")
+        marker = (
+            " †" if _row_has_cross_regime_eval(row) and row.mean_auroc is not None
+            else ""
+        )
+        mean_cells.append(f"**{_format_float(row.mean_auroc)}**{marker}")
     lines.append("| " + " | ".join(mean_cells) + " |")
 
     # Mirror render_markdown: append the diagnostics section when any
