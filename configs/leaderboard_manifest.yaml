@@ -14,6 +14,13 @@ experiments:
     output_dir: outputs/E0_reproduction
     description: "16 independent single-task models (paper baseline)"
     innovation: null
+    # Optional: extra eval output dirs to surface as diagnostics in the
+    # leaderboard. Each dir follows the per-ckpt contract produced by
+    # scripts/eval_e0_global*.py:
+    #   <dir>/<ckpt_disease>/metrics_ckpt_<ckpt_disease>.csv
+    eval_dirs:
+      global_shared: outputs/E0_global_eval
+      global_cohort: outputs/E0_global_eval_cohort
 
   - id: E1
     display_name: "E1 — Hierarchical Multi-Task (Full FT)"
