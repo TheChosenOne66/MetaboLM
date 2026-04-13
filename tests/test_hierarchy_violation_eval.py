@@ -14,29 +14,29 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 import eval_hierarchy_violation as ehv
 
 
-def test_or_aggregate_chapter_probs_basic():
+def test_mean_aggregate_chapter_probs_basic():
     """Two samples × 3 leaves; chapter 0 covers leaves [0, 2]; chapter 1 covers leaf [1]."""
     leaf_probs = np.array(
         [
-            [0.0, 0.5, 0.0],   # sample 0: chap0 = 1 - (1-0)*(1-0) = 0; chap1 = 0.5
-            [0.5, 0.5, 0.5],   # sample 1: chap0 = 1 - 0.5*0.5    = 0.75; chap1 = 0.5
+            [0.0, 0.5, 0.0],   # sample 0: chap0 = mean(0, 0) = 0; chap1 = 0.5
+            [0.5, 0.5, 0.5],   # sample 1: chap0 = mean(0.5, 0.5) = 0.5; chap1 = 0.5
         ],
         dtype=np.float32,
     )
-    chap_probs = ehv.or_aggregate_chapter_probs(
+    chap_probs = ehv.mean_aggregate_chapter_probs(
         leaf_probs,
         disease_to_chapter_idx={0: 0, 1: 1, 2: 0},
         n_chapters=2,
     )
     assert chap_probs.shape == (2, 2)
-    assert np.allclose(chap_probs[:, 0], [0.0, 0.75])
+    assert np.allclose(chap_probs[:, 0], [0.0, 0.5])
     assert np.allclose(chap_probs[:, 1], [0.5, 0.5])
 
 
-def test_or_aggregate_chapter_probs_all_zero():
+def test_mean_aggregate_chapter_probs_all_zero():
     """All-zero leaves → all-zero chapters."""
     leaf_probs = np.zeros((3, 4), dtype=np.float32)
-    chap_probs = ehv.or_aggregate_chapter_probs(
+    chap_probs = ehv.mean_aggregate_chapter_probs(
         leaf_probs,
         disease_to_chapter_idx={0: 0, 1: 0, 2: 1, 3: 1},
         n_chapters=2,
@@ -45,17 +45,22 @@ def test_or_aggregate_chapter_probs_all_zero():
     assert np.allclose(chap_probs, 0.0)
 
 
-def test_or_aggregate_chapter_probs_all_one():
-    """A single leaf at 1.0 saturates its chapter to 1.0."""
-    leaf_probs = np.array([[1.0, 0.3, 0.2, 0.1]], dtype=np.float32)
-    chap_probs = ehv.or_aggregate_chapter_probs(
+def test_mean_aggregate_chapter_probs_violation_possible():
+    """Critical contrast with OR/max: a single high leaf in a multi-leaf chapter
+    can produce a chapter prob LOWER than itself (its siblings drag down the mean).
+    This is the property that makes mean a non-trivial HVR baseline.
+    """
+    # Chapter 0 covers leaves [0, 1, 2]. Leaf 0 is high (0.9), the others zero.
+    # Mean = 0.3, so leaf 0 (0.9) > chap (0.3) — violation possible.
+    leaf_probs = np.array([[0.9, 0.0, 0.0]], dtype=np.float32)
+    chap_probs = ehv.mean_aggregate_chapter_probs(
         leaf_probs,
-        disease_to_chapter_idx={0: 0, 1: 0, 2: 1, 3: 1},
-        n_chapters=2,
+        disease_to_chapter_idx={0: 0, 1: 0, 2: 0},
+        n_chapters=1,
     )
-    assert np.isclose(chap_probs[0, 0], 1.0)
-    # chap 1 = 1 - (1-0.2)(1-0.1) = 1 - 0.8*0.9 = 0.28
-    assert np.isclose(chap_probs[0, 1], 0.28)
+    assert np.isclose(chap_probs[0, 0], 0.3)
+    # Sanity: leaf 0 > chap 0 (this is the property that breaks for OR/max).
+    assert leaf_probs[0, 0] > chap_probs[0, 0] + 1e-7
 
 
 def test_compute_and_persist_hvr_basic(tmp_path):
@@ -163,25 +168,25 @@ def test_load_e0_leaf_probs_partial_dir():
     assert np.all(np.isnan(leaf_probs[:, hypertension_idx]))
 
 
-def test_run_e0_or_mode_partial_dir(tmp_path):
+def test_run_e0_baseline_mode_partial_dir(tmp_path):
     """End-to-end on the partial fixture: only T2D + obesity contribute.
 
-    With T2D and obesity both in chapter_04, OR-aggregation gives:
-        chapter_04 prob[i] = 1 - (1 - p_T2D[i]) * (1 - p_obesity[i])
-    Sample 0: 1 - 0.1 * 0.8 = 0.92  ; T2D=0.9 OK (not strictly > 0.92) ; obesity=0.2 OK
-    Sample 1: 1 - 0.9 * 0.3 = 0.73  ; T2D=0.1 OK ; obesity=0.7 OK (not strictly > 0.73)
-    Sample 2: 1 - 0.2 * 0.4 = 0.92  ; T2D=0.8 OK ; obesity=0.6 OK
-    Expected violations from T2D / obesity rows = 0 / 6 = 0.0
+    With T2D and obesity both in chapter_04, mean-aggregation gives:
+        chapter_04 prob[i] = mean(p_T2D[i], p_obesity[i])
+    Sample 0: mean(0.9, 0.2) = 0.55 ; T2D=0.9 > 0.55 VIOLATION ; obesity=0.2 OK
+    Sample 1: mean(0.1, 0.7) = 0.4  ; T2D=0.1 OK ; obesity=0.7 > 0.4 VIOLATION
+    Sample 2: mean(0.8, 0.6) = 0.7  ; T2D=0.8 > 0.7 VIOLATION ; obesity=0.6 OK
+    Expected violations from T2D / obesity rows = 3 / 6 = 0.5
     All other 14 leaves have NaN probs → must be dropped (not counted).
     """
-    out_path = tmp_path / "hierarchy_violation_or.json"
-    payload = ehv.run_e0_or_mode(FIXTURES / "eval_dir", out_path)
+    out_path = tmp_path / "hierarchy_violation_baseline.json"
+    payload = ehv.run_e0_baseline_mode(FIXTURES / "eval_dir", out_path)
 
     assert out_path.exists()
-    assert payload["method"] == "or_aggregate_baseline"
+    assert payload["method"] == "mean_aggregate_baseline"
     assert payload["n_samples"] == 3
     # Only the 2 present diseases count toward the leaf-chapter pair total.
     assert payload["n_leaf_chapter_pairs"] == 2
-    assert pytest.approx(payload["hierarchy_violation_rate"], abs=1e-6) == 0.0
+    assert pytest.approx(payload["hierarchy_violation_rate"], abs=1e-6) == 0.5
     # Provenance: predictions_source path is recorded
     assert "eval_dir" in payload["method_details"]["predictions_source"]
