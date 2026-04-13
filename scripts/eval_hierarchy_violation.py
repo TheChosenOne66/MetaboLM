@@ -1,5 +1,5 @@
 """Evaluate Hierarchy Violation Rate (HVR) for multitask checkpoints (E1-E4)
-and an OR-aggregation baseline for E0.
+and a mean-aggregation baseline for E0.
 
 See docs/superpowers/plans/2026-04-13-hierarchy-violation-eval.md for the
 full design rationale.
@@ -24,13 +24,13 @@ logging.basicConfig(
 logger = logging.getLogger("eval_hierarchy_violation")
 
 
-def or_aggregate_chapter_probs(
+def mean_aggregate_chapter_probs(
     leaf_probs: np.ndarray,
     disease_to_chapter_idx: dict[int, int],
     n_chapters: int,
 ) -> np.ndarray:
-    """Aggregate per-leaf probabilities into per-chapter probabilities via
-    independence-OR: ``P_chap = 1 - ∏(1 - p_leaf for leaf in chapter)``.
+    """Aggregate per-leaf probabilities into per-chapter probabilities via the
+    arithmetic mean: ``P_chap = mean(p_leaf for leaf in chapter)``.
 
     Args:
         leaf_probs: ``(N, n_leaves)`` probabilities in [0, 1].
@@ -39,13 +39,17 @@ def or_aggregate_chapter_probs(
 
     Returns:
         ``(N, n_chapters)`` chapter-level probabilities. The (i, c) cell is
-        the probability that *at least one* leaf in chapter ``c`` is positive
-        for sample ``i``, assuming the leaves are independent given the
-        sample (an oversimplification, but a standard baseline).
+        the average leaf probability for chapter ``c`` on sample ``i``.
 
-    Used as the E0 baseline for hierarchy violation: E0 has no chapter head,
-    so we synthesise one this way to get a non-trivial violation rate (vs
-    ``max`` which would make violations identically zero).
+    Used as the E0 baseline for hierarchy violation rate. **Why mean and not
+    max / OR / noisy-OR**: both ``max(p_leaf)`` and ``1 - prod(1 - p_leaf)``
+    (the independence-OR) are *upper bounds* on every leaf prob — by
+    construction ``p_leaf <= chap_prob`` always, so the HVR strict
+    comparison ``p_leaf > chap_prob + 1e-7`` is never true and the metric
+    returns 0.0 identically. The mean is the simplest aggregation that
+    *can* be exceeded by individual leaves (any leaf above its sibling
+    mean violates), so it produces the non-trivial baseline number we need
+    to demonstrate the value of E1's explicit hierarchy loss.
     """
     n_samples, n_leaves = leaf_probs.shape
     if len(disease_to_chapter_idx) != n_leaves:
@@ -53,12 +57,16 @@ def or_aggregate_chapter_probs(
             f"disease_to_chapter_idx covers {len(disease_to_chapter_idx)} leaves, "
             f"but leaf_probs has {n_leaves} columns"
         )
-    # Initialise chapter "no positive" probability to 1; multiply (1 - p_leaf)
-    # for each leaf that lives under that chapter, then take the complement.
-    one_minus = np.ones((n_samples, n_chapters), dtype=np.float32)
+    sums = np.zeros((n_samples, n_chapters), dtype=np.float32)
+    counts = np.zeros(n_chapters, dtype=np.int32)
     for leaf_idx, chap_idx in disease_to_chapter_idx.items():
-        one_minus[:, chap_idx] *= (1.0 - leaf_probs[:, leaf_idx])
-    return (1.0 - one_minus).astype(np.float32)
+        sums[:, chap_idx] += leaf_probs[:, leaf_idx]
+        counts[chap_idx] += 1
+    # Avoid division by zero for chapters with no mapped leaves: leave their
+    # column as 0.0 (no leaves means no possible violations from that chapter
+    # anyway, so the value is unobservable in HVR).
+    safe_counts = np.where(counts > 0, counts, 1).astype(np.float32)
+    return (sums / safe_counts).astype(np.float32)
 
 
 def compute_and_persist_hvr(
@@ -76,7 +84,7 @@ def compute_and_persist_hvr(
         chap_probs: ``(N, 6)`` chapter probabilities in [0, 1].
         output_path: Where to write the JSON.
         method: Short identifier (e.g. ``"explicit_chapter_head"`` or
-            ``"or_aggregate_baseline"``). Surfaced in the JSON for downstream
+            ``"mean_aggregate_baseline"``). Surfaced in the JSON for downstream
             disambiguation.
         method_details: Free-form dict appended to the JSON for provenance
             (model path, predictions source dir, etc.).
@@ -94,7 +102,7 @@ def compute_and_persist_hvr(
             number of (leaf, parent_chapter) pairs actually evaluated by the
             canonical metric, NOT ``leaf_probs.shape[1]``. They coincide when
             the full 16-leaf mapping is used; they differ when a caller passes
-            a sub-mapping (e.g. Task 3's E0-OR path with a partial eval dir,
+            a sub-mapping (e.g. the E0 baseline path with a partial eval dir,
             where missing diseases are dropped before this helper is called).
           * ``method`` (str): the ``method`` argument.
           * ``method_details`` (dict): copy of the ``method_details`` argument.
@@ -122,7 +130,7 @@ def compute_and_persist_hvr(
     # ``n_leaf_chapter_pairs`` is the number of (leaf, parent_chapter) pairs the
     # canonical metric iterates over (``len(disease_to_chapter_idx)``), NOT the
     # number of leaf columns. They coincide when the full 16-leaf mapping is
-    # used; they differ when a caller (e.g. Task 3's E0-OR with a partial eval
+    # used; they differ when a caller (e.g. the E0 baseline with a partial eval
     # dir) passes a sub-mapping over the present leaves only.
     payload = {
         "hierarchy_violation_rate": float(rate),
@@ -211,16 +219,19 @@ def load_e0_leaf_probs(
     return leaf_probs, present
 
 
-def run_e0_or_mode(
+def run_e0_baseline_mode(
     eval_dir: Path,
     output_path: Path,
 ) -> dict:
-    """E0 baseline mode: read 16 leaf prob columns from ``eval_dir``, OR-aggregate
+    """E0 baseline mode: read 16 leaf prob columns from ``eval_dir``, mean-aggregate
     to chapter probs, compute HVR, persist.
 
     This is the baseline Innovation 2 (hierarchy loss) is supposed to fix.
     We expect a high HVR here because E0's per-disease models have no
-    structural prior tying leaf probs to a shared chapter prob.
+    structural prior tying leaf probs to a shared chapter prob. We use mean
+    aggregation rather than OR/max because the latter are upper bounds on
+    every leaf prob and trivialise HVR to 0.0 — see
+    :func:`mean_aggregate_chapter_probs` for the full rationale.
 
     Args:
         eval_dir: Eval output dir produced by ``scripts/eval_e0_global*.py``.
@@ -239,7 +250,7 @@ def run_e0_or_mode(
 
     leaf_probs, present = load_e0_leaf_probs(eval_dir, diseases)
 
-    # Drop missing diseases entirely so OR aggregation isn't poisoned by NaN.
+    # Drop missing diseases entirely so mean aggregation isn't poisoned by NaN.
     # The canonical metric only iterates the mapping we pass it, so limiting
     # the mapping to ``present`` diseases gives the correct "pairs evaluated"
     # count in the persisted payload (via ``compute_and_persist_hvr``'s
@@ -251,7 +262,7 @@ def run_e0_or_mode(
         for new_idx, old_idx in enumerate(present_idx)
     }
 
-    chap_probs = or_aggregate_chapter_probs(
+    chap_probs = mean_aggregate_chapter_probs(
         leaf_probs_clean,
         disease_to_chapter_idx=sub_disease_to_chap,
         n_chapters=n_chapters,
@@ -261,12 +272,12 @@ def run_e0_or_mode(
         leaf_probs=leaf_probs_clean,
         chap_probs=chap_probs,
         output_path=output_path,
-        method="or_aggregate_baseline",
+        method="mean_aggregate_baseline",
         method_details={
             "chap_probs_source": (
-                "P_chap = 1 - prod(1 - p_leaf for leaf in chapter); "
-                "assumes leaf independence given the sample (a baseline, "
-                "not a justified probabilistic claim)."
+                "P_chap = mean(p_leaf for leaf in chapter); chosen because OR/max are "
+                "upper bounds on the leaves and trivialise HVR. See "
+                "mean_aggregate_chapter_probs docstring for rationale."
             ),
             "predictions_source": str(eval_dir),
             "n_present_diseases": len(present),
