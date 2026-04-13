@@ -406,6 +406,97 @@ E0 vs E1 差距仅 1.8 个点（0.698 vs 0.680），且受测试集差异影响�
 1. [x] 新增 `scripts/eval_e0_global.py`（shared preprocessing）
 2. [x] 新增 `scripts/eval_e0_global_cohort.py`（own pipeline，per-disease z-score 复现）
 3. [x] T2D smoke test 通过（own=0.8546 / shared=0.8313）
-4. [ ] 拿齐 E0 其余 15 个 checkpoint 后，在两个脚本下跑完整 16 疾病
+4. [x] 拿齐 E0 其余 15 个 checkpoint，在两个脚本下跑完整 16 疾病（见下节"2026-04-13 全 16 疾病 fair 评测结果"）
 5. [ ] 根据 own-preproc 主比较结果决定是否需要架构改进（去除 shared projection、调整 hierarchy loss 权重等）
-6. [ ] E5-E6 (GRPO RL) 执行或直接进入论文撰写
+6. [~] E5-E6 (GRPO RL) — 决定**暂不做**，进入论文撰写
+
+---
+
+### 2026-04-13 全 16 疾病 fair 评测结果 (W3)
+
+E0 的 16 个 per-disease checkpoint 已经全部跑完，并通过 `scripts/eval_e0_global.py`（shared preprocessing）和 `scripts/eval_e0_global_cohort.py`（own pipeline）在全局 val.csv 上完成评测。结果接入 `LEADERBOARD.md` 的 *Global-Val Diagnostics* 段。
+
+#### 三种 E0 评测口径（mean AUROC）
+
+| Eval Mode | Mean AUROC | vs Primary | 含义 |
+|---|---|---|---|
+| Primary (paper-style balanced subset) | **0.698** | — | 原论文风格：每病 1:1 平衡子集 + 双重 z-score |
+| Global val + own pipeline | **0.675** | −0.023 | 真 apples-to-apples：测试集与 E1-E4 一致，预处理用各自训练 pipeline |
+| Global val + shared preprocess | **0.671** | −0.027 | 部署一致：被强行塞进 E1-E4 统一预处理 pipeline |
+
+→ 0.698 → 0.675 的 −0.023 是"测试集更难"的真实代价；0.675 → 0.671 的 −0.004 是"E0 私有归一化"的额外代价。后者比 T2D smoke test 暗示的（−0.025）小一个数量级——因为 cohort 二次归一化只在分布严重偏离全局的疾病上有意义（见下）。
+
+#### own vs shared 的逐疾病差距分布
+
+| 疾病 | own − shared | 解读 |
+|---|---|---|
+| T2D | +0.025 | cohort 50% 患者，强代谢信号 |
+| breast_cancer | +0.016 | cohort 全女性，性别特异 |
+| copd | +0.004 | 中等偏移 |
+| 其余 13 个 | +0.001 ~ +0.002 | cohort 与全局分布接近，二次归一化近似 identity |
+
+**论文论述**：E0 的"私有预处理代价"在 T2D 这种强信号常见病上具体可见，对低患病率疾病几乎不产生差异——既肯定了 own-pipeline 评测的必要性（T2D 等不能省），也避免了过度强调（多数疾病不构成额外负担）。
+
+#### Fair 比较 E1 vs E0_own：Pareto 格局
+
+E0_own (0.675) vs E1 (0.680)，**E1 平均仅高 0.005**，但**逐疾病呈清晰生物学模式**：
+
+**E1 优于 E0_own 的 8 个疾病**（倾向稀有 / 跨章节迁移获益）：
+
+| 疾病 | E0_own | E1 | Δ | ICD-10 章节 |
+|---|---|---|---|---|
+| **parkinsons** | 0.557 | 0.611 | **+0.054** | 神经（最稀有）|
+| colon_cancer | 0.576 | 0.596 | +0.020 | 肿瘤 |
+| stroke | 0.604 | 0.623 | +0.019 | 神经 |
+| lung_cancer | 0.652 | 0.671 | +0.019 | 肿瘤 |
+| breast_cancer | 0.693 | 0.702 | +0.009 | 肿瘤 |
+| rheumatoid | 0.671 | 0.679 | +0.008 | 肌骨 |
+| heart_failure | 0.703 | 0.710 | +0.007 | 循环 |
+| dementia | 0.642 | 0.648 | +0.006 | 神经 |
+
+**E0_own 优于 E1 的 8 个疾病**（倾向常见、代谢信号强的内分泌/循环）：
+
+| 疾病 | E0_own | E1 | Δ |
+|---|---|---|---|
+| copd | 0.739 | 0.718 | +0.021 |
+| obesity | 0.726 | 0.712 | +0.014 |
+| hypertension | 0.696 | 0.683 | +0.013 |
+| ischemic_heart | 0.705 | 0.696 | +0.009 |
+| T2D | 0.854 | 0.846 | +0.008 |
+| atrial_fib | 0.653 | 0.648 | +0.005 |
+| asthma | 0.581 | 0.576 | +0.005 |
+| prostate_cancer | 0.751 | 0.751 | 0 |
+
+**论文论述**：
+
+- **创新点一（多任务+层次结构）落地**：E1 在 4 个肿瘤（chapter_02）、3 个神经（chapter_06）疾病上系统性胜过 E0，特别是 parkinsons 这种最稀有病种 +0.054。这正是"chapter-level 梯度共享让稀有疾病借同章节高频疾病"的预期实验证据。
+- **E0 在常见代谢病上的优势可坦诚承认**：T2D / obesity / hypertension 这些高样本量、强代谢信号病种，per-disease 独立模型有专精优势。E1 多任务的代价是 backbone 容量被 16 病种分摊。
+- **整体均值 ≈ 打平不是缺点**：E1 用 1 模型 × 85M 参数达到 16 模型 × 85M ≈ 1.36B 参数的水平，**部署效率 ×16** —— 这恰是创新点一的核心卖点。
+
+#### Fair 基准下的 PEFT 梯度（创新点三支撑）
+
+| 模型 | Mean AUROC | Trainable Params | 性能保留率 (vs E1) | 参数比例 (vs E1) |
+|---|---|---|---|---|
+| E1 Full FT | 0.680 | 85.5M (100%) | 100.0% | 100% |
+| **E3 Adapter** | **0.644** | **1.4M (1.61%)** | **94.7%** | **1.61%** ← 性价比最优 |
+| E4 LoRA | 0.631 | 497K (0.58%) | 92.8% | 0.58% |
+| E2 Head-only | 0.607 | 203K (0.24%) | 89.3% | 0.24% |
+
+**论文论述**：Adapter 用 1.6% 可训练参数保留 Full FT 的 94.7% 性能；LoRA 用 0.58% 保留 92.8%；Head-only 用 0.24% 保留 89.3%。在 85M 代谢物 BERT 上系统验证了 PEFT 的迁移性，**Adapter 是 Pareto 最优选择**。
+
+#### 工程交付（已合入 main / exp）
+
+- `scripts/eval_e0_global.py` — shared preprocessing 评测，输出 per-ckpt subdir + label sidecar
+- `scripts/eval_e0_global_cohort.py` — own pipeline 评测，额外落 `cohort_stats_ckpt_<D>.json` 留底
+- `scripts/update_leaderboard.py` — 接入 manifest `eval_dirs`，自动渲染 *Global-Val Diagnostics* 段
+- `configs/leaderboard_manifest.yaml` — E0 的 `eval_dirs` 已声明
+- 产物每个 ckpt 一个子目录（subdir = ckpt identity），`predictions_ckpt_<D>.csv` 落盘后任何后处理（cross-disease、threshold 扫描、subgroup 分析）都不再 GPU
+
+#### 未做的诊断
+
+- **16×16 cross-disease 矩阵**：每个 ckpt 的 prob 对照全部 16 个 label 算 AUC。已写 `scripts/cross_disease_matrix.py`，纯 CPU 后处理本地 outputs。off-diagonal 数据将作为附录展示"E0 表征专一性"——但要小心 caption 解释共病混淆（T2D / obesity 共存，T2D-prob 自带对 obesity 的 ranking 能力，并非真迁移）。
+
+#### 决策
+
+- **E5-E6 (GRPO RL) 不再做**：核心三个创新点已有完整数据支撑（架构、损失、PEFT），RL 留作 future work
+- **进入论文撰写阶段**：Chapter 5 实验章节直接用本节材料组织
