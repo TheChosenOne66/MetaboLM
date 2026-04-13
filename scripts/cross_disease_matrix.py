@@ -126,15 +126,24 @@ def build_matrix(
             logger.warning("[%s] no predictions on disk — skipping", ckpt_disease)
             continue
 
-        # Align probs to label index; drop any eids the labels file lacks
-        # (shouldn't happen if both came from the same run).
+        # Align probs to label index. We require a *complete* alignment on
+        # the full eval set: if the prediction CSV is truncated / filtered /
+        # has mismatched eids, a subset-based AUC would silently bias any
+        # cross-row comparison (rows in the output matrix would no longer
+        # share the same ``N_Total_eval``), so we skip the ckpt entirely
+        # rather than emit a partial row. Consumers can then trust every
+        # row in ``cross_disease_matrix.csv`` to be scored on exactly the
+        # same 84k-row eval set.
         joined = labels_df.join(probs.rename("prob"), how="inner")
         if len(joined) != len(labels_df):
             logger.warning(
-                "[%s] eid alignment lost %d rows (labels=%d, joined=%d)",
-                ckpt_disease, len(labels_df) - len(joined),
-                len(labels_df), len(joined),
+                "[%s] eid alignment incomplete (labels=%d, joined=%d, "
+                "missing=%d) — skipping to avoid subset-based AUC bias. "
+                "Verify the predictions file matches the current val.csv.",
+                ckpt_disease, len(labels_df), len(joined),
+                len(labels_df) - len(joined),
             )
+            continue
         if len(joined) == 0:
             logger.warning("[%s] empty join with labels — skipping", ckpt_disease)
             continue
@@ -201,15 +210,18 @@ def write_outputs(
                 ])
     logger.info("Wrote %s (%d rows)", long_path, len(matrix) * matrix.shape[1])
 
-    # Summary JSON: diagonal mean, off-diagonal mean per ckpt
+    # Summary JSON: diagonal mean, off-diagonal mean per ckpt. All NaN-valued
+    # fields go through ``_none_if_nan`` so the JSON is strict-parseable
+    # (``json.dump`` would otherwise emit a non-standard ``NaN`` literal that
+    # breaks strict consumers like ``json.loads(..., parse_constant=...)``).
+    diag_values = [
+        matrix.loc[c, c] for c in matrix.index if c in matrix.columns
+    ]
     summary = {
         "n_ckpts_present": int(len(matrix)),
         "n_labels": int(matrix.shape[1]),
         "n_total_eval_samples": int(n_total),
-        "diagonal_mean_auc": _safe_mean([
-            float(matrix.loc[c, c])
-            for c in matrix.index if c in matrix.columns
-        ]),
+        "diagonal_mean_auc": _none_if_nan(_safe_mean(diag_values)),
         "per_ckpt": {},
     }
     for ckpt_disease, row in matrix.iterrows():
