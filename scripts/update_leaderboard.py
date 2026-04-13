@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -31,6 +32,22 @@ import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def resolve_output_dir(path_str: str, repo_root: Path) -> Path:
+    """Resolve leaderboard output dirs under repo root or shared output base."""
+    path = Path(path_str)
+    if path.is_absolute():
+        return path
+
+    output_base = os.environ.get("METABOLM_OUTPUT_BASE", "").strip()
+    if output_base:
+        parts = path.parts
+        if parts and parts[0] == "outputs":
+            path = Path(*parts[1:])
+        return Path(output_base) / path
+
+    return repo_root / path
 
 
 class ExperimentType(str, Enum):
@@ -182,7 +199,7 @@ def load_manifest(path: Path) -> Manifest:
 def parse_per_disease_sft(
     exp_dir: Path, canonical_diseases: list[str]
 ) -> dict[str, Any]:
-    """Parse E0 output: read finetune_summary_metrics.csv.
+    """Parse E0 output from summary CSV and per-disease metric files.
 
     Returns a dict with keys that map onto ExperimentRow fields.
     Never raises — on any error returns status=ERROR with error_message.
@@ -205,39 +222,89 @@ def parse_per_disease_sft(
         "error_message": None,
     }
 
-    if not exp_dir.exists() or not csv_path.exists():
+    if not exp_dir.exists():
         return empty_result
 
-    try:
-        df = pd.read_csv(csv_path)
-    except Exception as e:
-        return {**empty_result, "status": ExperimentStatus.ERROR,
-                "error_message": f"CSV parse error: {e}"}
-
-    if "Disease" not in df.columns or "Val_AUC" not in df.columns:
-        return {**empty_result, "status": ExperimentStatus.ERROR,
-                "error_message": "CSV missing required columns Disease/Val_AUC"}
-
     per_disease_auroc: dict[str, float] = {}
+    best_epoch_by_disease: dict[str, int] = {}
     canonical_set = set(canonical_diseases)
-    for _, row in df.iterrows():
-        disease = str(row["Disease"])
-        if disease not in canonical_set:
-            print(
-                f"[WARN] parse_per_disease_sft({exp_dir.name}): "
-                f"unknown disease '{disease}' in CSV, skipping",
-                file=sys.stderr,
-            )
-            continue
+
+    def _merge_metrics(df: pd.DataFrame, source_label: str) -> str | None:
+        if "Disease" not in df.columns or "Val_AUC" not in df.columns:
+            return f"{source_label} missing required columns Disease/Val_AUC"
+
+        for _, row in df.iterrows():
+            disease = str(row["Disease"])
+            if disease not in canonical_set:
+                print(
+                    f"[WARN] parse_per_disease_sft({exp_dir.name}): "
+                    f"unknown disease '{disease}' in {source_label}, skipping",
+                    file=sys.stderr,
+                )
+                continue
+            try:
+                per_disease_auroc[disease] = float(row["Val_AUC"])
+            except (ValueError, TypeError):
+                print(
+                    f"[WARN] parse_per_disease_sft({exp_dir.name}): "
+                    f"non-numeric Val_AUC for '{disease}' in {source_label}, skipping",
+                    file=sys.stderr,
+                )
+                continue
+
+            if "Best_Epoch" in df.columns:
+                try:
+                    best_epoch_by_disease[disease] = int(row["Best_Epoch"])
+                except (ValueError, TypeError):
+                    pass
+
+        return None
+
+    if csv_path.exists():
         try:
-            per_disease_auroc[disease] = float(row["Val_AUC"])
-        except (ValueError, TypeError):
-            print(
-                f"[WARN] parse_per_disease_sft({exp_dir.name}): "
-                f"non-numeric Val_AUC for '{disease}', skipping",
-                file=sys.stderr,
-            )
+            df = pd.read_csv(csv_path)
+        except Exception as e:
+            return {
+                **empty_result,
+                "status": ExperimentStatus.ERROR,
+                "error_message": f"CSV parse error: {e}",
+            }
+
+        error_message = _merge_metrics(df, "finetune_summary_metrics.csv")
+        if error_message is not None:
+            return {
+                **empty_result,
+                "status": ExperimentStatus.ERROR,
+                "error_message": error_message,
+            }
+
+    # Fall back to per-disease metric files when the summary CSV is missing
+    # or incomplete. This keeps the leaderboard aligned with finished runs
+    # even if the aggregate file was not refreshed.
+    for disease in canonical_diseases:
+        if disease in per_disease_auroc:
             continue
+
+        metrics_path = exp_dir / disease / f"finetune_metrics_{disease}.csv"
+        if not metrics_path.exists():
+            continue
+
+        try:
+            disease_df = pd.read_csv(metrics_path)
+        except Exception as e:
+            return {
+                **empty_result,
+                "status": ExperimentStatus.ERROR,
+                "error_message": f"{metrics_path.name} parse error: {e}",
+            }
+
+        error_message = _merge_metrics(disease_df, metrics_path.name)
+        if error_message is not None:
+            return {
+                **empty_result,
+                "status": ExperimentStatus.ERROR,
+                "error_message": error_message,
+            }
 
     n_done = len(per_disease_auroc)
     if n_done == 0:
@@ -246,17 +313,7 @@ def parse_per_disease_sft(
     mean_auroc = sum(per_disease_auroc.values()) / n_done
 
     # Best epoch: take max across completed rows (for display only)
-    best_epoch: int | None = None
-    if "Best_Epoch" in df.columns:
-        try:
-            valid_epochs = [
-                int(e) for e, d in zip(df["Best_Epoch"], df["Disease"])
-                if str(d) in canonical_set
-            ]
-            if valid_epochs:
-                best_epoch = max(valid_epochs)
-        except (ValueError, TypeError):
-            pass
+    best_epoch = max(best_epoch_by_disease.values()) if best_epoch_by_disease else None
 
     status = (
         ExperimentStatus.COMPLETED if n_done == len(canonical_diseases)
@@ -419,11 +476,7 @@ def collect_experiment_rows(
     rows: list[ExperimentRow] = []
 
     for entry in manifest.experiments:
-        # Resolve output_dir relative to repo_root if it's not absolute
-        out_path = Path(entry.output_dir)
-        if not out_path.is_absolute():
-            out_path = repo_root / out_path
-
+        out_path = resolve_output_dir(entry.output_dir, repo_root)
         parser = _PARSERS[entry.exp_type]
         try:
             parsed = parser(out_path, manifest.diseases)
