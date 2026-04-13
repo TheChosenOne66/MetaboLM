@@ -222,10 +222,14 @@ def main() -> None:
         # Compute mean AUC
         aucs = [r["Global_Val_AUC"] for r in results if r["Global_Val_AUC"] > 0]
         mean_auc = sum(aucs) / len(aucs) if aucs else 0
+        # Aggregate per-disease positives. ``results`` currently holds only the
+        # per-disease rows — the MEAN entry is appended *after* the dict literal
+        # is fully constructed, so we iterate ``results`` directly here rather
+        # than ``results[:-1]`` (which would drop the last disease).
         results.append({
             "Disease": "MEAN",
             "Global_Val_AUC": round(mean_auc, 4),
-            "N_Positive": sum(r["N_Positive"] for r in results[:-1] if "N_Positive" in r),
+            "N_Positive": sum(r["N_Positive"] for r in results if "N_Positive" in r),
             "N_Negative": "-",
             "Prevalence_pct": "-",
         })
