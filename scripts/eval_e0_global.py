@@ -48,11 +48,14 @@ logging.basicConfig(
 logger = logging.getLogger("eval_e0_global")
 
 
-def load_val_data(val_path: str) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """Load global val.csv and return (X, Y, disease_names).
+def load_val_data(
+    val_path: str,
+) -> tuple[list[str], np.ndarray, np.ndarray, list[str]]:
+    """Load global val.csv and return (eids, X, Y, disease_names).
 
+    eids: list of N participant ids (kept as strings to avoid silent int casts)
     X: (N, 168) float32 — already z-score normalised by prepare_data.py
-    Y: (N, 16) float32 — binary labels
+    Y: (N, 16) float32 — binary labels in canonical disease order
     """
     feature_cols = get_metabolite_names()
     disease_names = get_disease_names()
@@ -63,22 +66,53 @@ def load_val_data(val_path: str) -> tuple[np.ndarray, np.ndarray, list[str]]:
         reader = csv.reader(f)
         header = next(reader)
 
+    if "eid" not in header:
+        raise ValueError(
+            f"val.csv missing required 'eid' column; header starts with {header[:5]}..."
+        )
+    eid_index = header.index("eid")
     feat_indices = [header.index(c) for c in feature_cols]
     label_indices = [header.index(c) for c in label_cols]
 
+    eids: list[str] = []
     X_rows = []
     Y_rows = []
     with open(val_path, "r") as f:
         reader = csv.reader(f)
         next(reader)  # skip header
         for row in reader:
+            eids.append(row[eid_index])
             X_rows.append([float(row[i]) for i in feat_indices])
             Y_rows.append([float(row[i]) for i in label_indices])
 
     X = np.array(X_rows, dtype=np.float32)
     Y = np.array(Y_rows, dtype=np.float32)
-    logger.info("Loaded val.csv: %d samples, %d features, %d labels", X.shape[0], X.shape[1], Y.shape[1])
-    return X, Y, disease_names
+    logger.info("Loaded val.csv: %d samples, %d features, %d labels",
+                X.shape[0], X.shape[1], Y.shape[1])
+    return eids, X, Y, disease_names
+
+
+def write_eval_set_labels(
+    output_dir: str,
+    eids: list[str],
+    Y: np.ndarray,
+    disease_names: list[str],
+) -> None:
+    """Write the val.csv label matrix once at the top of the eval output dir.
+
+    Stored once (not duplicated under every per-ckpt subdir) so each eval
+    output dir is self-contained for downstream analysis without joining
+    val.csv, while keeping per-ckpt directories small.
+    """
+    label_cols = [f"label_{d}" for d in disease_names]
+    path = os.path.join(output_dir, "eval_set_labels.csv")
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["eid"] + label_cols)
+        for j, eid in enumerate(eids):
+            writer.writerow([eid] + [int(Y[j, k]) for k in range(len(disease_names))])
+    logger.info("Wrote %s (%d samples × %d label cols)",
+                path, len(eids), len(label_cols))
 
 
 def load_correlation_matrix(cfg, device: torch.device) -> torch.Tensor:
@@ -172,12 +206,27 @@ def main() -> None:
     logger.info("Device: %s", device)
 
     # Load global val data (already z-score normalised by prepare_data.py)
-    X_val, Y_val, disease_names = load_val_data(cfg.data.val_path)
+    eids, X_val, Y_val, disease_names = load_val_data(cfg.data.val_path)
 
     # Load correlation matrix
     bias_matrix = load_correlation_matrix(cfg, device)
 
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Output dir contract (subdir = CKPT identity, file names suffixed with the
+    # ckpt disease for grep-friendliness):
+    #
+    #   {output_dir}/
+    #     eval_set_labels.csv                      # val.csv labels (one copy)
+    #     {ckpt_disease}/                          # one per E0 checkpoint
+    #       predictions_ckpt_{ckpt_disease}.csv    # eid, prob
+    #       metrics_ckpt_{ckpt_disease}.csv        # ckpt_disease, eval_label, AUC, ...
+    #     e0_global_val_metrics.csv                # diagonal aggregate (16 + MEAN)
+    #     summary.json
+    #
+    # Per-ckpt subdirs let parallel runs (e.g. one Nebula task per checkpoint)
+    # write without colliding on the aggregate CSV.
+    write_eval_set_labels(args.output_dir, eids, Y_val, disease_names)
 
     # Evaluate each E0 checkpoint on global val
     results = []
@@ -187,15 +236,30 @@ def main() -> None:
             logger.warning("[%s] Checkpoint not found: %s — skipping", disease_name, ckpt_path)
             continue
 
+        # Per-ckpt subdir = ckpt identity (matches scripts/train.py convention).
+        ckpt_subdir = os.path.join(args.output_dir, disease_name)
+        os.makedirs(ckpt_subdir, exist_ok=True)
+
         logger.info("[%s] Loading checkpoint and predicting on %d samples...", disease_name, len(X_val))
         probs = predict_single_disease(ckpt_path, X_val, bias_matrix, device, args.batch_size)
+        probs_flat = np.asarray(probs).reshape(-1).astype(np.float64)
+
+        # Persist per-sample probabilities so any downstream analysis (threshold
+        # sweep, calibration, sub-cohort breakdown, 16x16 cross-disease scoring)
+        # can run without rerunning GPU forward.
+        pred_path = os.path.join(ckpt_subdir, f"predictions_ckpt_{disease_name}.csv")
+        with open(pred_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["eid", f"prob_ckpt_{disease_name}"])
+            for j, eid in enumerate(eids):
+                writer.writerow([eid, f"{probs_flat[j]:.6f}"])
 
         labels = Y_val[:, i]
         n_pos = int(labels.sum())
         n_neg = len(labels) - n_pos
 
         try:
-            auc = float(roc_auc_score(labels, probs))
+            auc = float(roc_auc_score(labels, probs_flat))
         except ValueError as e:
             # Typically raised when ``labels`` is single-class on this eval set.
             # Record NaN (rather than 0.0) so downstream aggregation can tell
@@ -204,12 +268,27 @@ def main() -> None:
                            disease_name, e)
             auc = float("nan")
 
+        # Per-ckpt metrics file. Schema lets us extend to 16x16 cross-disease
+        # eval later by appending more rows (one per evaluated label) without
+        # touching the schema.
+        prev_pct = round(n_pos / len(labels) * 100, 2)
+        metrics_path = os.path.join(ckpt_subdir, f"metrics_ckpt_{disease_name}.csv")
+        with open(metrics_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "ckpt_disease", "eval_label", "Val_AUC",
+                "N_Positive", "N_Negative", "Prevalence_pct",
+            ])
+            auc_cell = "" if math.isnan(auc) else f"{auc:.4f}"
+            writer.writerow([disease_name, disease_name, auc_cell,
+                             n_pos, n_neg, prev_pct])
+
         results.append({
             "Disease": disease_name,
             "Global_Val_AUC": auc if math.isnan(auc) else round(auc, 4),
             "N_Positive": n_pos,
             "N_Negative": n_neg,
-            "Prevalence_pct": round(n_pos / len(labels) * 100, 2),
+            "Prevalence_pct": prev_pct,
         })
         logger.info("[%s] Global val AUC = %s  (pos=%d, neg=%d, prev=%.2f%%)",
                      disease_name,
