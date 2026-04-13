@@ -139,3 +139,138 @@ def compute_and_persist_hvr(
         payload["n_samples"], method,
     )
     return payload
+
+
+def load_e0_leaf_probs(
+    eval_dir: Path, disease_names: list[str]
+) -> tuple[np.ndarray, list[str]]:
+    """Read per-ckpt predictions under ``eval_dir/<disease>/predictions_ckpt_<D>.csv``
+    and return ``(leaf_probs, present_diseases)``.
+
+    Aligns by the ``eid`` column of ``eval_dir/eval_set_labels.csv`` so all
+    disease columns share a row order. Diseases without a predictions file
+    contribute a column of ``NaN`` — the caller is responsible for handling
+    those (typically by dropping them before aggregation).
+
+    Args:
+        eval_dir: Output dir produced by ``scripts/eval_e0_global*.py``.
+            Must contain ``eval_set_labels.csv`` at the top and optionally
+            per-disease subdirs with ``predictions_ckpt_<D>.csv``.
+        disease_names: Canonical disease order. Output columns follow this
+            order exactly.
+
+    Returns:
+        Tuple ``(leaf_probs, present)``:
+            - ``leaf_probs``: ``(N, len(disease_names))`` float32 array. Rows
+              are aligned to ``eval_set_labels.csv``'s eid order; missing
+              disease columns are filled with ``NaN``.
+            - ``present``: subset of ``disease_names`` whose predictions file
+              was found and successfully read. Order matches the input
+              ``disease_names``.
+    """
+    import pandas as pd
+
+    labels_path = eval_dir / "eval_set_labels.csv"
+    if not labels_path.exists():
+        raise FileNotFoundError(
+            f"{labels_path} not found — run scripts/eval_e0_global*.py first."
+        )
+
+    labels_df = pd.read_csv(labels_path)
+    if "eid" not in labels_df.columns:
+        raise ValueError(f"{labels_path} missing 'eid' column")
+    eids = labels_df["eid"].astype(str).tolist()
+
+    n = len(eids)
+    leaf_probs = np.full((n, len(disease_names)), np.nan, dtype=np.float32)
+    present: list[str] = []
+
+    eid_to_row = {eid: i for i, eid in enumerate(eids)}
+    for col_idx, disease in enumerate(disease_names):
+        pred_path = eval_dir / disease / f"predictions_ckpt_{disease}.csv"
+        if not pred_path.exists():
+            continue
+        pred_df = pd.read_csv(pred_path)
+        prob_col = f"prob_ckpt_{disease}"
+        if "eid" not in pred_df.columns or prob_col not in pred_df.columns:
+            logger.warning(
+                "[%s] %s has unexpected schema; skipping",
+                disease, pred_path.name,
+            )
+            continue
+        # Iterate via column arrays to avoid pandas' row-wise dtype promotion
+        # (int eids become floats and stringify as "1.0", breaking the join).
+        pred_eids = pred_df["eid"].astype(str).tolist()
+        pred_vals = pred_df[prob_col].astype(float).tolist()
+        for eid_str, val in zip(pred_eids, pred_vals):
+            i = eid_to_row.get(eid_str)
+            if i is None:
+                continue
+            leaf_probs[i, col_idx] = val
+        present.append(disease)
+    return leaf_probs, present
+
+
+def run_e0_or_mode(
+    eval_dir: Path,
+    output_path: Path,
+) -> dict:
+    """E0 baseline mode: read 16 leaf prob columns from ``eval_dir``, OR-aggregate
+    to chapter probs, compute HVR, persist.
+
+    This is the baseline Innovation 2 (hierarchy loss) is supposed to fix.
+    We expect a high HVR here because E0's per-disease models have no
+    structural prior tying leaf probs to a shared chapter prob.
+
+    Args:
+        eval_dir: Eval output dir produced by ``scripts/eval_e0_global*.py``.
+        output_path: Where to write the HVR sidecar JSON.
+
+    Returns:
+        The payload dict written to ``output_path``.
+    """
+    from src.data.endpoints import (
+        get_disease_names, get_disease_to_chapter_idx, get_unique_chapters,
+    )
+
+    diseases = get_disease_names()
+    full_disease_to_chap = get_disease_to_chapter_idx()
+    n_chapters = len(get_unique_chapters())
+
+    leaf_probs, present = load_e0_leaf_probs(eval_dir, diseases)
+
+    # Drop missing diseases entirely so OR aggregation isn't poisoned by NaN.
+    # The canonical metric only iterates the mapping we pass it, so limiting
+    # the mapping to ``present`` diseases gives the correct "pairs evaluated"
+    # count in the persisted payload (via ``compute_and_persist_hvr``'s
+    # ``n_leaf_chapter_pairs = len(disease_to_chapter_idx)`` semantics).
+    present_idx = [diseases.index(d) for d in present]
+    leaf_probs_clean = leaf_probs[:, present_idx]
+    sub_disease_to_chap = {
+        new_idx: full_disease_to_chap[old_idx]
+        for new_idx, old_idx in enumerate(present_idx)
+    }
+
+    chap_probs = or_aggregate_chapter_probs(
+        leaf_probs_clean,
+        disease_to_chapter_idx=sub_disease_to_chap,
+        n_chapters=n_chapters,
+    )
+
+    return compute_and_persist_hvr(
+        leaf_probs=leaf_probs_clean,
+        chap_probs=chap_probs,
+        output_path=output_path,
+        method="or_aggregate_baseline",
+        method_details={
+            "chap_probs_source": (
+                "P_chap = 1 - prod(1 - p_leaf for leaf in chapter); "
+                "assumes leaf independence given the sample (a baseline, "
+                "not a justified probabilistic claim)."
+            ),
+            "predictions_source": str(eval_dir),
+            "n_present_diseases": len(present),
+            "present_diseases": present,
+        },
+        disease_to_chapter_idx=sub_disease_to_chap,
+    )

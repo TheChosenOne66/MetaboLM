@@ -131,3 +131,57 @@ def test_compute_and_persist_hvr_partial_mapping(tmp_path):
     # Sample 0 violates on leaf 0 (0.9 > 0.5); sample 1 violates on
     # nothing. Total 1 / 4 = 0.25 (2 samples × 2 mapped pairs).
     assert pytest.approx(payload["hierarchy_violation_rate"], abs=1e-6) == 0.25
+
+
+FIXTURES = Path(__file__).parent / "fixtures" / "hierarchy_violation"
+
+
+def test_load_e0_leaf_probs_partial_dir():
+    """Loader returns a (3, 16) matrix; missing diseases are NaN columns."""
+    from src.data.endpoints import get_disease_names
+    diseases = get_disease_names()
+
+    leaf_probs, present = ehv.load_e0_leaf_probs(
+        FIXTURES / "eval_dir", diseases,
+    )
+    assert leaf_probs.shape == (3, 16)
+    assert "T2D" in present and "obesity" in present
+    assert len(present) == 2
+
+    t2d_idx = diseases.index("T2D")
+    obesity_idx = diseases.index("obesity")
+    hypertension_idx = diseases.index("hypertension")
+
+    # Present columns: exact values from the fixture
+    np.testing.assert_allclose(
+        leaf_probs[:, t2d_idx], [0.9, 0.1, 0.8], atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        leaf_probs[:, obesity_idx], [0.2, 0.7, 0.6], atol=1e-6,
+    )
+    # Missing columns: NaN
+    assert np.all(np.isnan(leaf_probs[:, hypertension_idx]))
+
+
+def test_run_e0_or_mode_partial_dir(tmp_path):
+    """End-to-end on the partial fixture: only T2D + obesity contribute.
+
+    With T2D and obesity both in chapter_04, OR-aggregation gives:
+        chapter_04 prob[i] = 1 - (1 - p_T2D[i]) * (1 - p_obesity[i])
+    Sample 0: 1 - 0.1 * 0.8 = 0.92  ; T2D=0.9 OK (not strictly > 0.92) ; obesity=0.2 OK
+    Sample 1: 1 - 0.9 * 0.3 = 0.73  ; T2D=0.1 OK ; obesity=0.7 OK (not strictly > 0.73)
+    Sample 2: 1 - 0.2 * 0.4 = 0.92  ; T2D=0.8 OK ; obesity=0.6 OK
+    Expected violations from T2D / obesity rows = 0 / 6 = 0.0
+    All other 14 leaves have NaN probs → must be dropped (not counted).
+    """
+    out_path = tmp_path / "hierarchy_violation_or.json"
+    payload = ehv.run_e0_or_mode(FIXTURES / "eval_dir", out_path)
+
+    assert out_path.exists()
+    assert payload["method"] == "or_aggregate_baseline"
+    assert payload["n_samples"] == 3
+    # Only the 2 present diseases count toward the leaf-chapter pair total.
+    assert payload["n_leaf_chapter_pairs"] == 2
+    assert pytest.approx(payload["hierarchy_violation_rate"], abs=1e-6) == 0.0
+    # Provenance: predictions_source path is recorded
+    assert "eval_dir" in payload["method_details"]["predictions_source"]
