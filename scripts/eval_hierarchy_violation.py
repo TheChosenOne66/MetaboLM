@@ -87,6 +87,17 @@ def compute_and_persist_hvr(
 
     Returns:
         The dict that was written to disk (also useful for in-process logging).
+        Keys:
+          * ``hierarchy_violation_rate`` (float): rate from the canonical metric.
+          * ``n_samples`` (int): ``leaf_probs.shape[0]``.
+          * ``n_leaf_chapter_pairs`` (int): ``len(disease_to_chapter_idx)`` — the
+            number of (leaf, parent_chapter) pairs actually evaluated by the
+            canonical metric, NOT ``leaf_probs.shape[1]``. They coincide when
+            the full 16-leaf mapping is used; they differ when a caller passes
+            a sub-mapping (e.g. Task 3's E0-OR path with a partial eval dir,
+            where missing diseases are dropped before this helper is called).
+          * ``method`` (str): the ``method`` argument.
+          * ``method_details`` (dict): copy of the ``method_details`` argument.
     """
     # Lazy import: the metric lives next to training code and pulls in heavier
     # imports we don't want at script-import time.
@@ -108,10 +119,15 @@ def compute_and_persist_hvr(
         disease_to_chapter_idx,
     )
 
+    # ``n_leaf_chapter_pairs`` is the number of (leaf, parent_chapter) pairs the
+    # canonical metric iterates over (``len(disease_to_chapter_idx)``), NOT the
+    # number of leaf columns. They coincide when the full 16-leaf mapping is
+    # used; they differ when a caller (e.g. Task 3's E0-OR with a partial eval
+    # dir) passes a sub-mapping over the present leaves only.
     payload = {
         "hierarchy_violation_rate": float(rate),
         "n_samples": int(leaf_probs.shape[0]),
-        "n_leaf_chapter_pairs": int(leaf_probs.shape[1]),
+        "n_leaf_chapter_pairs": int(len(disease_to_chapter_idx)),
         "method": method,
         "method_details": dict(method_details),
     }

@@ -98,3 +98,36 @@ def test_compute_and_persist_hvr_basic(tmp_path):
     assert written["n_samples"] == 2
     assert written["n_leaf_chapter_pairs"] == 4
     assert pytest.approx(written["hierarchy_violation_rate"], abs=1e-6) == 0.25
+
+
+def test_compute_and_persist_hvr_partial_mapping(tmp_path):
+    """``n_leaf_chapter_pairs`` tracks the mapping, not leaf_probs column count.
+
+    If a caller provides a sub-mapping (e.g. Task 3's E0-OR with some
+    missing diseases), only the mapped leaves contribute pairs — the
+    persisted field must reflect that.
+    """
+    # 2 samples × 4 leaf columns, but mapping only covers 2 of them.
+    leaf_probs = np.array(
+        [[0.9, 0.1, 0.9, 0.9], [0.0, 0.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    chap_probs = np.array([[0.5, 0.5], [0.5, 0.5]], dtype=np.float32)
+    out_path = tmp_path / "hierarchy_violation_partial.json"
+
+    payload = ehv.compute_and_persist_hvr(
+        leaf_probs=leaf_probs,
+        chap_probs=chap_probs,
+        output_path=out_path,
+        method="unit_test",
+        method_details={},
+        # Only leaves 0 and 1 are mapped; leaves 2 and 3 are deliberately
+        # ignored (simulating Task 3's "only present diseases" case).
+        disease_to_chapter_idx={0: 0, 1: 0},
+    )
+
+    # Pair count is len(mapping) = 2, NOT leaf_probs.shape[1] = 4.
+    assert payload["n_leaf_chapter_pairs"] == 2
+    # Sample 0 violates on leaf 0 (0.9 > 0.5); sample 1 violates on
+    # nothing. Total 1 / 4 = 0.25 (2 samples × 2 mapped pairs).
+    assert pytest.approx(payload["hierarchy_violation_rate"], abs=1e-6) == 0.25
