@@ -32,7 +32,8 @@ Usage::
     python scripts/eval_e0_global_cohort.py \
         --config configs/reproduce.yaml \
         --e0-dir outputs/E0_reproduction \
-        --output-dir outputs/E0_global_eval_cohort
+        --output-dir outputs/E0_global_eval_cohort \
+        --ckpt-disease T2D
 """
 
 from __future__ import annotations
@@ -54,7 +55,7 @@ from sklearn.metrics import roc_auc_score
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.train import build_disease_cohort  # noqa: E402  single source of truth
-from src.config import load_config  # noqa: E402
+from src.config import _resolve_output_path, load_config  # noqa: E402
 from src.data.biomarkers import get_metabolite_names  # noqa: E402
 from src.data.endpoints import get_disease_names  # noqa: E402
 
@@ -237,6 +238,17 @@ def main() -> None:
     parser.add_argument("--config", default="configs/reproduce.yaml")
     parser.add_argument("--e0-dir", default="outputs/E0_reproduction")
     parser.add_argument("--output-dir", default="outputs/E0_global_eval_cohort")
+    parser.add_argument(
+        "--ckpt-disease",
+        required=True,
+        help="Disease name whose E0 checkpoint should be evaluated.",
+    )
+    parser.add_argument(
+        "--eval-diseases",
+        nargs="+",
+        default=None,
+        help="Subset of disease labels to evaluate. Defaults to all diseases.",
+    )
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument(
         "--cohort-seed", type=int, default=None,
@@ -266,214 +278,129 @@ def main() -> None:
         cfg.data.train_path, cfg.data.val_path,
     )
     disease_names = get_disease_names()
+    disease_to_index = {name: idx for idx, name in enumerate(disease_names)}
+    if args.ckpt_disease not in disease_to_index:
+        raise ValueError(
+            f"--ckpt-disease '{args.ckpt_disease}' is not in canonical diseases: {disease_names}"
+        )
+
+    eval_diseases = args.eval_diseases or disease_names
+    unknown_eval_diseases = [name for name in eval_diseases if name not in disease_to_index]
+    if unknown_eval_diseases:
+        raise ValueError(
+            f"--eval-diseases contains unknown diseases: {unknown_eval_diseases}"
+        )
 
     bias_matrix = load_correlation_matrix(cfg, device)
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    resolved_e0_dir = _resolve_output_path(args.e0_dir)
+    resolved_output_dir = _resolve_output_path(args.output_dir)
+    os.makedirs(resolved_output_dir, exist_ok=True)
+    ckpt_disease = args.ckpt_disease
+    ckpt_path = os.path.join(
+        resolved_e0_dir, ckpt_disease, f"best_finetune_model_{ckpt_disease}.pt",
+    )
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    # Output dir contract (subdir = CKPT identity, file names suffixed with the
-    # ckpt disease for grep-friendliness):
-    #
-    #   {output_dir}/
-    #     eval_set_labels.csv                      # val.csv labels (one copy)
-    #     {ckpt_disease}/                          # one per E0 checkpoint
-    #       predictions_ckpt_{ckpt_disease}.csv    # eid, prob
-    #       metrics_ckpt_{ckpt_disease}.csv        # ckpt_disease, eval_label, AUC, ...
-    #       cohort_stats_ckpt_{ckpt_disease}.json  # mean/std for repro (cohort variant only)
-    #     e0_global_val_metrics_own_preproc.csv    # diagonal aggregate
-    #     summary.json
-    write_eval_set_labels(args.output_dir, eids, Y_val, disease_names)
+    ckpt_subdir = os.path.join(resolved_output_dir, ckpt_disease)
+    os.makedirs(ckpt_subdir, exist_ok=True)
 
-    results = []
-    for i, disease_name in enumerate(disease_names):
-        ckpt_path = os.path.join(
-            args.e0_dir, disease_name, f"best_finetune_model_{disease_name}.pt",
-        )
-        if not os.path.exists(ckpt_path):
-            logger.warning("[%s] Checkpoint not found: %s — skipping",
-                           disease_name, ckpt_path)
-            continue
+    label_col = f"label_{ckpt_disease}"
+    stats = compute_cohort_train_stats(
+        df, ckpt_disease, label_col, feature_cols, label_cols,
+        seed=cohort_seed,
+    )
+    if stats is None:
+        raise RuntimeError(f"[{ckpt_disease}] build_disease_cohort returned None")
+    train_mean, train_std, n_cohort_train = stats
 
-        # Per-ckpt subdir = ckpt identity (matches scripts/train.py convention).
-        ckpt_subdir = os.path.join(args.output_dir, disease_name)
-        os.makedirs(ckpt_subdir, exist_ok=True)
+    stats_path = os.path.join(
+        ckpt_subdir, f"cohort_stats_ckpt_{ckpt_disease}.json",
+    )
+    with open(stats_path, "w") as f:
+        json.dump({
+            "ckpt_disease": ckpt_disease,
+            "seed": int(cohort_seed),
+            "feature_cols": feature_cols,
+            "train_mean": train_mean.tolist(),
+            "train_std": train_std.tolist(),
+            "n_cohort_train": int(n_cohort_train),
+            "build_disease_cohort_source": "scripts/train.py:build_disease_cohort",
+        }, f, indent=2)
 
-        label_col = f"label_{disease_name}"
-        stats = compute_cohort_train_stats(
-            df, disease_name, label_col, feature_cols, label_cols,
-            seed=cohort_seed,
-        )
-        if stats is None:
-            logger.warning("[%s] build_disease_cohort returned None — skipping",
-                           disease_name)
-            continue
-        train_mean, train_std, n_cohort_train = stats
+    X_val_d = ((X_val - train_mean) / train_std).astype(np.float32)
 
-        # Persist the per-disease cohort z-score parameters so this evaluation
-        # is reproducible even if scripts/train.py:build_disease_cohort or the
-        # underlying data changes later. These are the *exact* numbers applied
-        # to val.csv before the model forward.
-        stats_path = os.path.join(
-            ckpt_subdir, f"cohort_stats_ckpt_{disease_name}.json",
-        )
-        with open(stats_path, "w") as f:
-            json.dump({
-                "ckpt_disease": disease_name,
-                "seed": int(cohort_seed),
-                "feature_cols": feature_cols,
-                "train_mean": train_mean.tolist(),
-                "train_std": train_std.tolist(),
-                "n_cohort_train": int(n_cohort_train),
-                "build_disease_cohort_source": "scripts/train.py:build_disease_cohort",
-            }, f, indent=2)
+    logger.info(
+        "[%s] Loading checkpoint and predicting on %d samples with "
+        "per-disease cohort stats (mean_abs_max=%.4f, std_range=[%.4f, %.4f], "
+        "e0_dir=%s, output_dir=%s)",
+        ckpt_disease, len(X_val_d),
+        float(np.max(np.abs(train_mean))),
+        float(train_std.min()), float(train_std.max()),
+        resolved_e0_dir, resolved_output_dir,
+    )
+    probs = predict_single_disease(ckpt_path, X_val_d, bias_matrix, device,
+                                   args.batch_size)
+    probs_flat = np.asarray(probs).reshape(-1).astype(np.float64)
 
-        # Apply E0's per-disease cohort z-score to the globally z-scored val.csv.
-        X_val_d = ((X_val - train_mean) / train_std).astype(np.float32)
+    pred_path = os.path.join(
+        ckpt_subdir, f"predictions_ckpt_{ckpt_disease}.csv",
+    )
+    with open(pred_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["eid", f"prob_ckpt_{ckpt_disease}"])
+        for j, eid in enumerate(eids):
+            writer.writerow([eid, f"{probs_flat[j]:.6f}"])
 
-        logger.info(
-            "[%s] Loading checkpoint and predicting on %d samples with "
-            "per-disease cohort stats (mean_abs_max=%.4f, std_range=[%.4f, %.4f])",
-            disease_name, len(X_val_d),
-            float(np.max(np.abs(train_mean))),
-            float(train_std.min()), float(train_std.max()),
-        )
-        probs = predict_single_disease(ckpt_path, X_val_d, bias_matrix, device,
-                                       args.batch_size)
-        probs_flat = np.asarray(probs).reshape(-1).astype(np.float64)
+    metrics_path = os.path.join(
+        ckpt_subdir, f"metrics_ckpt_{ckpt_disease}.csv",
+    )
+    rows = []
+    with open(metrics_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "ckpt_disease", "eval_label", "Val_AUC",
+            "N_Positive", "N_Negative", "Prevalence_pct",
+        ])
+        for eval_disease in eval_diseases:
+            labels = Y_val[:, disease_to_index[eval_disease]]
+            n_pos = int(labels.sum())
+            n_neg = len(labels) - n_pos
 
-        # Persist per-sample probabilities (see eval_e0_global.py for rationale).
-        pred_path = os.path.join(
-            ckpt_subdir, f"predictions_ckpt_{disease_name}.csv",
-        )
-        with open(pred_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["eid", f"prob_ckpt_{disease_name}"])
-            for j, eid in enumerate(eids):
-                writer.writerow([eid, f"{probs_flat[j]:.6f}"])
+            try:
+                auc = float(roc_auc_score(labels, probs_flat))
+            except ValueError as e:
+                logger.warning("[%s -> %s] roc_auc_score failed (%s); recording NaN",
+                               ckpt_disease, eval_disease, e)
+                auc = float("nan")
 
-        labels = Y_val[:, i]
-        n_pos = int(labels.sum())
-        n_neg = len(labels) - n_pos
-
-        try:
-            auc = float(roc_auc_score(labels, probs_flat))
-        except ValueError as e:
-            # Typically raised when ``labels`` is single-class on this eval set.
-            # Record NaN (rather than 0.0) so downstream aggregation can tell
-            # this apart from a legitimate low-but-nonzero AUC.
-            logger.warning("[%s] roc_auc_score failed (%s); recording NaN",
-                           disease_name, e)
-            auc = float("nan")
-
-        # Per-ckpt metrics file (same schema as eval_e0_global.py for consumer
-        # parity: a single update_leaderboard parser handles both variants).
-        prev_pct = round(n_pos / len(labels) * 100, 2)
-        metrics_path = os.path.join(
-            ckpt_subdir, f"metrics_ckpt_{disease_name}.csv",
-        )
-        with open(metrics_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "ckpt_disease", "eval_label", "Val_AUC",
-                "N_Positive", "N_Negative", "Prevalence_pct",
-            ])
+            prev_pct = round(n_pos / len(labels) * 100, 2)
             auc_cell = "" if math.isnan(auc) else f"{auc:.4f}"
-            writer.writerow([disease_name, disease_name, auc_cell,
+            writer.writerow([ckpt_disease, eval_disease, auc_cell,
                              n_pos, n_neg, prev_pct])
+            rows.append({
+                "eval_label": eval_disease,
+                "auc": auc,
+                "n_pos": n_pos,
+                "n_neg": n_neg,
+                "prev_pct": prev_pct,
+            })
 
-        results.append({
-            "Disease": disease_name,
-            "Global_Val_AUC_Own_Preproc": auc if math.isnan(auc) else round(auc, 4),
-            "N_Positive": n_pos,
-            "N_Negative": n_neg,
-            "Prevalence_pct": prev_pct,
-        })
-        logger.info("[%s] Global val AUC (own preproc) = %s "
-                    "(pos=%d, neg=%d, prev=%.2f%%)",
-                    disease_name,
-                    "NaN" if math.isnan(auc) else f"{auc:.4f}",
-                    n_pos, n_neg, n_pos / len(labels) * 100)
-
-        torch.cuda.empty_cache()
-
-    if results:
-        csv_path = os.path.join(args.output_dir, "e0_global_val_metrics_own_preproc.csv")
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=results[0].keys())
-            writer.writeheader()
-            writer.writerows(results)
-
-        # Average only over diseases with a valid (non-NaN) AUC. We deliberately
-        # track the excluded set and surface it in the log instead of silently
-        # filtering with ``> 0`` (which would conflate a failed roc_auc_score
-        # sentinel with a legitimate low AUC).
-        valid_aucs = [r["Global_Val_AUC_Own_Preproc"] for r in results
-                      if not (isinstance(r["Global_Val_AUC_Own_Preproc"], float)
-                              and math.isnan(r["Global_Val_AUC_Own_Preproc"]))]
-        excluded = [r["Disease"] for r in results
-                    if isinstance(r["Global_Val_AUC_Own_Preproc"], float)
-                    and math.isnan(r["Global_Val_AUC_Own_Preproc"])]
-        if excluded:
-            logger.warning(
-                "MEAN excludes %d disease(s) with invalid AUC: %s",
-                len(excluded), excluded,
-            )
-        mean_auc = sum(valid_aucs) / len(valid_aucs) if valid_aucs else float("nan")
-        # Aggregate per-disease positives. ``results`` currently holds only the
-        # per-disease rows — the MEAN entry is appended *after* the dict literal
-        # is fully constructed, so we iterate ``results`` directly here rather
-        # than ``results[:-1]`` (which would drop the last disease).
-        results.append({
-            "Disease": "MEAN",
-            "Global_Val_AUC_Own_Preproc": round(mean_auc, 4),
-            "N_Positive": sum(r["N_Positive"] for r in results
-                              if "N_Positive" in r),
-            "N_Negative": "-",
-            "Prevalence_pct": "-",
-        })
-
-        # Also emit the comparison against the original balanced eval numbers
-        # so the log reader can see both preprocessing variants and the
-        # original balanced-subset number side-by-side.
-        e0_balanced = {
-            "T2D": 0.867, "obesity": 0.757, "hypertension": 0.706,
-            "ischemic_heart": 0.738, "atrial_fib": 0.683, "heart_failure": 0.722,
-            "rheumatoid": 0.676, "asthma": 0.620, "dementia": 0.652,
-            "copd": 0.753, "stroke": 0.651, "parkinsons": 0.611,
-            "breast_cancer": 0.687, "colon_cancer": 0.604, "lung_cancer": 0.667,
-            "prostate_cancer": 0.777,
-        }
-        logger.info("=" * 78)
-        logger.info("E0 Global Val Evaluation — Own preprocessing (per-disease z-score)")
-        logger.info("=" * 78)
-        logger.info("%-20s %16s %16s %10s", "Disease",
-                    "Global_Own_AUC", "Balanced_AUC*", "Delta")
-        logger.info("-" * 78)
-        for r in results:
-            name = r["Disease"]
-            g_auc = r["Global_Val_AUC_Own_Preproc"]
-            orig = e0_balanced.get(name)
-            if orig is not None:
-                logger.info("%-20s %16.4f %16.4f %+10.4f",
-                            name, g_auc, orig, g_auc - orig)
-            else:
-                logger.info("%-20s %16.4f %16s %10s", name, g_auc, "-", "-")
-        logger.info("=" * 78)
-
-        summary = {
-            "eval_set": "global val.csv",
-            # Use the resolved ``cohort_seed`` (not ``args.cohort_seed``, which
-            # is ``None`` when the user relies on the config-file default).
-            "preprocessing": f"per-disease cohort z-score replayed (seed={cohort_seed})",
-            "n_samples": len(X_val),
-            "mean_auc": mean_auc,
-            "per_disease": {r["Disease"]: r["Global_Val_AUC_Own_Preproc"]
-                            for r in results},
-        }
-        with open(os.path.join(args.output_dir, "summary.json"), "w") as f:
-            json.dump(summary, f, indent=2)
-
-        logger.info("Results saved to %s", args.output_dir)
+    logger.info("=" * 78)
+    logger.info("E0 Global Val Evaluation — own preprocessing")
+    logger.info("Checkpoint disease: %s", ckpt_disease)
+    logger.info("=" * 78)
+    logger.info("%-20s %16s %8s %8s %10s", "Eval_Label", "Global_AUC", "N_Pos", "N_Neg", "Prev%")
+    logger.info("-" * 78)
+    for row in rows:
+        auc_text = "NaN" if math.isnan(row["auc"]) else f"{row['auc']:.4f}"
+        logger.info(
+            "%-20s %16s %8d %8d %10.2f",
+            row["eval_label"], auc_text, row["n_pos"], row["n_neg"], row["prev_pct"],
+        )
+    logger.info("=" * 78)
+    logger.info("Worker results saved to %s", ckpt_subdir)
 
 
 if __name__ == "__main__":

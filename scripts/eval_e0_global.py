@@ -17,14 +17,14 @@ Usage::
     python scripts/eval_e0_global.py \
         --config configs/reproduce.yaml \
         --e0-dir outputs/E0_reproduction \
-        --output-dir outputs/E0_global_eval
+        --output-dir outputs/E0_global_eval \
+        --ckpt-disease T2D
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import json
 import logging
 import math
 import os
@@ -37,7 +37,7 @@ from sklearn.metrics import roc_auc_score
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.config import load_config
+from src.config import _resolve_output_path, load_config
 from src.data.biomarkers import get_metabolite_names
 from src.data.endpoints import get_disease_names
 
@@ -198,6 +198,17 @@ def main() -> None:
     parser.add_argument("--config", default="configs/reproduce.yaml", help="Config file.")
     parser.add_argument("--e0-dir", default="outputs/E0_reproduction", help="E0 output directory.")
     parser.add_argument("--output-dir", default="outputs/E0_global_eval", help="Output directory.")
+    parser.add_argument(
+        "--ckpt-disease",
+        required=True,
+        help="Disease name whose E0 checkpoint should be evaluated.",
+    )
+    parser.add_argument(
+        "--eval-diseases",
+        nargs="+",
+        default=None,
+        help="Subset of disease labels to evaluate. Defaults to all diseases.",
+    )
     parser.add_argument("--batch-size", type=int, default=512)
     args = parser.parse_args()
 
@@ -207,170 +218,95 @@ def main() -> None:
 
     # Load global val data (already z-score normalised by prepare_data.py)
     eids, X_val, Y_val, disease_names = load_val_data(cfg.data.val_path)
+    disease_to_index = {name: idx for idx, name in enumerate(disease_names)}
+    if args.ckpt_disease not in disease_to_index:
+        raise ValueError(
+            f"--ckpt-disease '{args.ckpt_disease}' is not in canonical diseases: {disease_names}"
+        )
+
+    eval_diseases = args.eval_diseases or disease_names
+    unknown_eval_diseases = [name for name in eval_diseases if name not in disease_to_index]
+    if unknown_eval_diseases:
+        raise ValueError(
+            f"--eval-diseases contains unknown diseases: {unknown_eval_diseases}"
+        )
 
     # Load correlation matrix
     bias_matrix = load_correlation_matrix(cfg, device)
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    resolved_e0_dir = _resolve_output_path(args.e0_dir)
+    resolved_output_dir = _resolve_output_path(args.output_dir)
+    os.makedirs(resolved_output_dir, exist_ok=True)
+    ckpt_disease = args.ckpt_disease
+    ckpt_path = os.path.join(
+        resolved_e0_dir, ckpt_disease, f"best_finetune_model_{ckpt_disease}.pt",
+    )
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    # Output dir contract (subdir = CKPT identity, file names suffixed with the
-    # ckpt disease for grep-friendliness):
-    #
-    #   {output_dir}/
-    #     eval_set_labels.csv                      # val.csv labels (one copy)
-    #     {ckpt_disease}/                          # one per E0 checkpoint
-    #       predictions_ckpt_{ckpt_disease}.csv    # eid, prob
-    #       metrics_ckpt_{ckpt_disease}.csv        # ckpt_disease, eval_label, AUC, ...
-    #     e0_global_val_metrics.csv                # diagonal aggregate (16 + MEAN)
-    #     summary.json
-    #
-    # Per-ckpt subdirs let parallel runs (e.g. one Nebula task per checkpoint)
-    # write without colliding on the aggregate CSV.
-    write_eval_set_labels(args.output_dir, eids, Y_val, disease_names)
+    ckpt_subdir = os.path.join(resolved_output_dir, ckpt_disease)
+    os.makedirs(ckpt_subdir, exist_ok=True)
 
-    # Evaluate each E0 checkpoint on global val
-    results = []
-    for i, disease_name in enumerate(disease_names):
-        ckpt_path = os.path.join(args.e0_dir, disease_name, f"best_finetune_model_{disease_name}.pt")
-        if not os.path.exists(ckpt_path):
-            logger.warning("[%s] Checkpoint not found: %s — skipping", disease_name, ckpt_path)
-            continue
+    logger.info(
+        "[%s] Loading checkpoint and predicting on %d samples... (e0_dir=%s, output_dir=%s)",
+        ckpt_disease, len(X_val), resolved_e0_dir, resolved_output_dir,
+    )
+    probs = predict_single_disease(ckpt_path, X_val, bias_matrix, device, args.batch_size)
+    probs_flat = np.asarray(probs).reshape(-1).astype(np.float64)
 
-        # Per-ckpt subdir = ckpt identity (matches scripts/train.py convention).
-        ckpt_subdir = os.path.join(args.output_dir, disease_name)
-        os.makedirs(ckpt_subdir, exist_ok=True)
+    pred_path = os.path.join(ckpt_subdir, f"predictions_ckpt_{ckpt_disease}.csv")
+    with open(pred_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["eid", f"prob_ckpt_{ckpt_disease}"])
+        for j, eid in enumerate(eids):
+            writer.writerow([eid, f"{probs_flat[j]:.6f}"])
 
-        logger.info("[%s] Loading checkpoint and predicting on %d samples...", disease_name, len(X_val))
-        probs = predict_single_disease(ckpt_path, X_val, bias_matrix, device, args.batch_size)
-        probs_flat = np.asarray(probs).reshape(-1).astype(np.float64)
+    metrics_path = os.path.join(ckpt_subdir, f"metrics_ckpt_{ckpt_disease}.csv")
+    rows = []
+    with open(metrics_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "ckpt_disease", "eval_label", "Val_AUC",
+            "N_Positive", "N_Negative", "Prevalence_pct",
+        ])
+        for eval_disease in eval_diseases:
+            labels = Y_val[:, disease_to_index[eval_disease]]
+            n_pos = int(labels.sum())
+            n_neg = len(labels) - n_pos
+            try:
+                auc = float(roc_auc_score(labels, probs_flat))
+            except ValueError as e:
+                logger.warning(
+                    "[%s -> %s] roc_auc_score failed (%s); recording NaN",
+                    ckpt_disease, eval_disease, e,
+                )
+                auc = float("nan")
 
-        # Persist per-sample probabilities so any downstream analysis (threshold
-        # sweep, calibration, sub-cohort breakdown, 16x16 cross-disease scoring)
-        # can run without rerunning GPU forward.
-        pred_path = os.path.join(ckpt_subdir, f"predictions_ckpt_{disease_name}.csv")
-        with open(pred_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["eid", f"prob_ckpt_{disease_name}"])
-            for j, eid in enumerate(eids):
-                writer.writerow([eid, f"{probs_flat[j]:.6f}"])
-
-        labels = Y_val[:, i]
-        n_pos = int(labels.sum())
-        n_neg = len(labels) - n_pos
-
-        try:
-            auc = float(roc_auc_score(labels, probs_flat))
-        except ValueError as e:
-            # Typically raised when ``labels`` is single-class on this eval set.
-            # Record NaN (rather than 0.0) so downstream aggregation can tell
-            # this apart from a legitimate low-but-nonzero AUC.
-            logger.warning("[%s] roc_auc_score failed (%s); recording NaN",
-                           disease_name, e)
-            auc = float("nan")
-
-        # Per-ckpt metrics file. Schema lets us extend to 16x16 cross-disease
-        # eval later by appending more rows (one per evaluated label) without
-        # touching the schema.
-        prev_pct = round(n_pos / len(labels) * 100, 2)
-        metrics_path = os.path.join(ckpt_subdir, f"metrics_ckpt_{disease_name}.csv")
-        with open(metrics_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "ckpt_disease", "eval_label", "Val_AUC",
-                "N_Positive", "N_Negative", "Prevalence_pct",
-            ])
+            prev_pct = round(n_pos / len(labels) * 100, 2)
             auc_cell = "" if math.isnan(auc) else f"{auc:.4f}"
-            writer.writerow([disease_name, disease_name, auc_cell,
-                             n_pos, n_neg, prev_pct])
+            writer.writerow([ckpt_disease, eval_disease, auc_cell, n_pos, n_neg, prev_pct])
+            rows.append({
+                "eval_label": eval_disease,
+                "auc": auc,
+                "n_pos": n_pos,
+                "n_neg": n_neg,
+                "prev_pct": prev_pct,
+            })
 
-        results.append({
-            "Disease": disease_name,
-            "Global_Val_AUC": auc if math.isnan(auc) else round(auc, 4),
-            "N_Positive": n_pos,
-            "N_Negative": n_neg,
-            "Prevalence_pct": prev_pct,
-        })
-        logger.info("[%s] Global val AUC = %s  (pos=%d, neg=%d, prev=%.2f%%)",
-                     disease_name,
-                     "NaN" if math.isnan(auc) else f"{auc:.4f}",
-                     n_pos, n_neg, n_pos / len(labels) * 100)
-
-        # Free GPU memory between diseases
-        torch.cuda.empty_cache()
-
-    # Save results
-    if results:
-        csv_path = os.path.join(args.output_dir, "e0_global_val_metrics.csv")
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=results[0].keys())
-            writer.writeheader()
-            writer.writerows(results)
-
-        # Average only over diseases with a valid (non-NaN) AUC. We deliberately
-        # track the excluded set and surface it in the log instead of silently
-        # filtering with ``> 0`` (which would conflate a failed roc_auc_score
-        # sentinel with a legitimate low AUC).
-        valid_aucs = [r["Global_Val_AUC"] for r in results
-                      if not (isinstance(r["Global_Val_AUC"], float)
-                              and math.isnan(r["Global_Val_AUC"]))]
-        excluded = [r["Disease"] for r in results
-                    if isinstance(r["Global_Val_AUC"], float)
-                    and math.isnan(r["Global_Val_AUC"])]
-        if excluded:
-            logger.warning(
-                "MEAN excludes %d disease(s) with invalid AUC: %s",
-                len(excluded), excluded,
-            )
-        mean_auc = sum(valid_aucs) / len(valid_aucs) if valid_aucs else float("nan")
-        # Aggregate per-disease positives. ``results`` currently holds only the
-        # per-disease rows — the MEAN entry is appended *after* the dict literal
-        # is fully constructed, so we iterate ``results`` directly here rather
-        # than ``results[:-1]`` (which would drop the last disease).
-        results.append({
-            "Disease": "MEAN",
-            "Global_Val_AUC": round(mean_auc, 4),
-            "N_Positive": sum(r["N_Positive"] for r in results if "N_Positive" in r),
-            "N_Negative": "-",
-            "Prevalence_pct": "-",
-        })
-
-        # Print summary table
-        logger.info("=" * 70)
-        logger.info("E0 Global Val Evaluation — Per-Disease AUROC")
-        logger.info("=" * 70)
-        logger.info("%-20s %12s %12s %8s", "Disease", "Global_AUC", "Original_AUC*", "Delta")
-        logger.info("-" * 70)
-        # *Original_AUC is from the per-disease balanced eval (LEADERBOARD.md)
-        e0_original = {
-            "T2D": 0.867, "obesity": 0.757, "hypertension": 0.706,
-            "ischemic_heart": 0.738, "atrial_fib": 0.683, "heart_failure": 0.722,
-            "rheumatoid": 0.676, "asthma": 0.620, "dementia": 0.652,
-            "copd": 0.753, "stroke": 0.651, "parkinsons": 0.611,
-            "breast_cancer": 0.687, "colon_cancer": 0.604, "lung_cancer": 0.667,
-            "prostate_cancer": 0.777,
-        }
-        for r in results:
-            name = r["Disease"]
-            g_auc = r["Global_Val_AUC"]
-            orig = e0_original.get(name, None)
-            if orig is not None:
-                delta = g_auc - orig
-                logger.info("%-20s %12.4f %12.4f %+8.4f", name, g_auc, orig, delta)
-            else:
-                logger.info("%-20s %12.4f %12s %8s", name, g_auc, "-", "-")
-        logger.info("=" * 70)
-
-        # Save summary JSON
-        summary = {
-            "eval_set": "global val.csv",
-            "n_samples": len(X_val),
-            "mean_auc": mean_auc,
-            "per_disease": {r["Disease"]: r["Global_Val_AUC"] for r in results},
-        }
-        with open(os.path.join(args.output_dir, "summary.json"), "w") as f:
-            json.dump(summary, f, indent=2)
-
-        logger.info("Results saved to %s", args.output_dir)
+    logger.info("=" * 78)
+    logger.info("E0 Global Val Evaluation — shared preprocess")
+    logger.info("Checkpoint disease: %s", ckpt_disease)
+    logger.info("=" * 78)
+    logger.info("%-20s %16s %8s %8s %10s", "Eval_Label", "Global_AUC", "N_Pos", "N_Neg", "Prev%")
+    logger.info("-" * 78)
+    for row in rows:
+        auc_text = "NaN" if math.isnan(row["auc"]) else f"{row['auc']:.4f}"
+        logger.info(
+            "%-20s %16s %8d %8d %10.2f",
+            row["eval_label"], auc_text, row["n_pos"], row["n_neg"], row["prev_pct"],
+        )
+    logger.info("=" * 78)
+    logger.info("Worker results saved to %s", ckpt_subdir)
 
 
 if __name__ == "__main__":
