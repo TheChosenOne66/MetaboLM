@@ -89,6 +89,13 @@ class ExperimentRow:
     per_disease_auroc: dict[str, float] = field(default_factory=dict)
     per_disease_auprc: dict[str, float] = field(default_factory=dict)
 
+    # Optional global-eval variants (populated from manifest ``eval_dirs``).
+    # Keys are eval-variant labels ("global_shared", "global_cohort", ...),
+    # values are per-disease AUROC dicts / their mean. ``None`` means the
+    # variant was not declared in the manifest or its output dir was absent.
+    eval_variant_mean_auroc: dict[str, float | None] = field(default_factory=dict)
+    eval_variant_per_disease_auroc: dict[str, dict[str, float]] = field(default_factory=dict)
+
     # Metadata
     num_completed_diseases: int | None = None  # E0 only
     total_diseases: int = 16
@@ -113,6 +120,12 @@ class ManifestExperiment:
     output_dir: str
     description: str
     innovation: str | None
+    # Optional: additional evaluation output directories keyed by variant name
+    # (e.g. ``global_shared``, ``global_cohort``). Each maps a label shown in
+    # LEADERBOARD.md to the filesystem path produced by one of the eval scripts
+    # under ``scripts/eval_e0_global*.py`` following the per-ckpt subdir
+    # contract (``<dir>/<ckpt_disease>/metrics_ckpt_<ckpt_disease>.csv``).
+    eval_dirs: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -173,6 +186,17 @@ def load_manifest(path: Path) -> Manifest:
             )
             sys.exit(1)
 
+        # ``eval_dirs`` is optional; tolerate missing/empty/malformed gracefully.
+        raw_eval_dirs = entry.get("eval_dirs") or {}
+        if not isinstance(raw_eval_dirs, dict):
+            print(
+                f"ERROR: experiment {entry['id']} 'eval_dirs' must be a mapping, "
+                f"got {type(raw_eval_dirs).__name__}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        eval_dirs = {str(k): str(v) for k, v in raw_eval_dirs.items()}
+
         experiments.append(
             ManifestExperiment(
                 id=entry["id"],
@@ -183,6 +207,7 @@ def load_manifest(path: Path) -> Manifest:
                 output_dir=entry["output_dir"],
                 description=entry["description"],
                 innovation=entry.get("innovation"),
+                eval_dirs=eval_dirs,
             )
         )
 
@@ -468,6 +493,73 @@ _PARSERS = {
 }
 
 
+def parse_global_eval_dir(
+    eval_dir: Path, canonical_diseases: list[str]
+) -> tuple[dict[str, float], float | None]:
+    """Parse per-ckpt metrics under an eval output dir.
+
+    The eval scripts under ``scripts/eval_e0_global*.py`` write per-ckpt
+    metrics to ``<eval_dir>/<ckpt_disease>/metrics_ckpt_<ckpt_disease>.csv``
+    with the schema ``ckpt_disease, eval_label, Val_AUC, N_Positive,
+    N_Negative, Prevalence_pct``. Only diagonal rows (``ckpt_disease ==
+    eval_label``) feed the main leaderboard columns — off-diagonal cross-
+    disease rows (if ever added for 16×16 analysis) are ignored here.
+
+    Returns ``(per_disease_auroc, mean_auroc)``. Missing/empty dir returns
+    ``({}, None)``.
+    """
+    per_disease: dict[str, float] = {}
+    eval_dir = Path(eval_dir)
+    if not eval_dir.exists():
+        return per_disease, None
+
+    for disease in canonical_diseases:
+        metrics_path = eval_dir / disease / f"metrics_ckpt_{disease}.csv"
+        if not metrics_path.exists():
+            continue
+        try:
+            df = pd.read_csv(metrics_path)
+        except Exception as e:
+            print(
+                f"[WARN] parse_global_eval_dir({eval_dir.name}/{disease}): "
+                f"CSV parse error ({e}); skipping",
+                file=sys.stderr,
+            )
+            continue
+
+        required = {"ckpt_disease", "eval_label", "Val_AUC"}
+        if not required.issubset(df.columns):
+            print(
+                f"[WARN] parse_global_eval_dir({eval_dir.name}/{disease}): "
+                f"missing columns {required - set(df.columns)}; skipping",
+                file=sys.stderr,
+            )
+            continue
+
+        diag = df[(df["ckpt_disease"] == disease) & (df["eval_label"] == disease)]
+        if diag.empty:
+            continue
+        val_auc = diag["Val_AUC"].iloc[0]
+        # Eval scripts write an empty ``Val_AUC`` cell when ``roc_auc_score``
+        # fails (e.g. single-class labels on the eval set). pandas loads the
+        # empty cell as ``NaN``, and ``float(NaN)`` silently returns ``NaN``
+        # instead of raising — so the ``except`` clause below is *not*
+        # sufficient on its own. Guard with ``pd.isna`` first, otherwise a
+        # NaN would slip into ``per_disease`` and poison the mean_auroc
+        # computed from it.
+        if pd.isna(val_auc):
+            continue
+        try:
+            per_disease[disease] = float(val_auc)
+        except (ValueError, TypeError):
+            continue
+
+    mean_auroc = (
+        sum(per_disease.values()) / len(per_disease) if per_disease else None
+    )
+    return per_disease, mean_auroc
+
+
 def collect_experiment_rows(
     manifest: Manifest, repo_root: Path
 ) -> list[ExperimentRow]:
@@ -501,6 +593,17 @@ def collect_experiment_rows(
                 "error_message": f"Unexpected exception: {e}",
             }
 
+        # Parse any additional eval variants declared in the manifest (e.g.
+        # E0's global-val shared/cohort evaluations). Missing dirs are OK —
+        # the variant just shows up as a dash in the rendered diagnostics.
+        eval_variant_mean: dict[str, float | None] = {}
+        eval_variant_per_disease: dict[str, dict[str, float]] = {}
+        for variant_label, variant_dir in entry.eval_dirs.items():
+            resolved = resolve_output_dir(variant_dir, repo_root)
+            per_disease, mean_auc = parse_global_eval_dir(resolved, manifest.diseases)
+            eval_variant_mean[variant_label] = mean_auc
+            eval_variant_per_disease[variant_label] = per_disease
+
         row = ExperimentRow(
             id=entry.id,
             display_name=entry.display_name,
@@ -520,6 +623,8 @@ def collect_experiment_rows(
             best_epoch=parsed["best_epoch"],
             per_disease_auroc=parsed["per_disease_auroc"],
             per_disease_auprc=parsed["per_disease_auprc"],
+            eval_variant_mean_auroc=eval_variant_mean,
+            eval_variant_per_disease_auroc=eval_variant_per_disease,
             num_completed_diseases=parsed["num_completed_diseases"],
             total_diseases=len(manifest.diseases),
             error_message=parsed["error_message"],
@@ -556,6 +661,105 @@ def _format_params(trainable: int | None, total: int | None) -> str:
 
 
 _PHASE_ABBREV = {"phase1": "P1", "phase2": "P2", "phase3": "P3"}
+
+
+# Human-readable names for eval variants declared in the manifest's
+# ``eval_dirs`` mapping. Unknown variant labels fall back to the raw key.
+_EVAL_VARIANT_DISPLAY = {
+    "global_shared": "Global val — shared preprocess (E1-E4 pipeline)",
+    "global_cohort": "Global val — own pipeline (per-disease cohort z-score)",
+}
+
+
+def _rows_with_eval_variants(rows: list[ExperimentRow]) -> list[ExperimentRow]:
+    """Filter to rows that have at least one non-empty eval variant."""
+    result = []
+    for r in rows:
+        if any(r.eval_variant_per_disease_auroc.get(v)
+               for v in r.eval_variant_mean_auroc):
+            result.append(r)
+    return result
+
+
+def _render_global_eval_diagnostics(
+    rows: list[ExperimentRow], diseases: list[str]
+) -> list[str]:
+    """Render the E0 Global-Val Diagnostics section.
+
+    Renders one sub-section per experiment that declared ``eval_dirs`` in
+    the manifest. Each shows a small Summary table (one row per variant +
+    the primary Mean AUROC as context) and a per-disease table with the
+    primary row and each variant's row.
+
+    Returns ``[]`` when no experiment has any eval variant data — the
+    caller simply omits the section.
+    """
+    relevant = _rows_with_eval_variants(rows)
+    if not relevant:
+        return []
+
+    lines: list[str] = []
+    lines.append("## Global-Val Diagnostics")
+    lines.append("")
+    lines.append(
+        "Additional eval modes for experiments that declare ``eval_dirs`` in "
+        "the manifest. The primary *Mean AUROC* above may use a different "
+        "evaluation set (e.g. E0's balanced per-disease subset). The rows "
+        "below re-evaluate the same checkpoints on the shared ``val.csv`` "
+        "so they can be compared like-for-like with E1-E4."
+    )
+    lines.append("")
+
+    for row in relevant:
+        # ``display_name`` typically already contains the experiment id
+        # (e.g. ``E0 — Per-Disease Baseline (Reproduction)``), so use it
+        # directly rather than prefixing with ``row.id`` again.
+        lines.append(f"### {row.display_name}")
+        lines.append("")
+        # Summary table
+        lines.append("| Eval Mode | Mean AUROC |")
+        lines.append("|---|:---:|")
+        primary_label = (
+            "Primary (paper-style balanced subset)"
+            if row.exp_type == ExperimentType.PER_DISEASE_SFT
+            else "Primary"
+        )
+        lines.append(
+            f"| {primary_label} | {_format_float(row.mean_auroc)} |"
+        )
+        for variant_label, mean_auc in row.eval_variant_mean_auroc.items():
+            display = _EVAL_VARIANT_DISPLAY.get(variant_label, variant_label)
+            lines.append(f"| {display} | {_format_float(mean_auc)} |")
+        lines.append("")
+
+        # Per-disease table: one column for the primary, one per variant
+        variant_labels = list(row.eval_variant_mean_auroc.keys())
+        header_cells = ["Disease", "Primary"] + [
+            _EVAL_VARIANT_DISPLAY.get(v, v) for v in variant_labels
+        ]
+        lines.append("| " + " | ".join(header_cells) + " |")
+        align_cells = ["---"] + [":---:"] * (len(variant_labels) + 1)
+        lines.append("| " + " | ".join(align_cells) + " |")
+
+        for disease in diseases:
+            cells = [disease, _format_float(row.per_disease_auroc.get(disease))]
+            for variant_label in variant_labels:
+                variant_per_disease = row.eval_variant_per_disease_auroc.get(
+                    variant_label, {}
+                )
+                cells.append(_format_float(variant_per_disease.get(disease)))
+            lines.append("| " + " | ".join(cells) + " |")
+
+        # MEAN row for this sub-section
+        mean_cells = ["**MEAN**", f"**{_format_float(row.mean_auroc)}**"]
+        for variant_label in variant_labels:
+            mean_cells.append(
+                f"**{_format_float(row.eval_variant_mean_auroc.get(variant_label))}**"
+            )
+        lines.append("| " + " | ".join(mean_cells) + " |")
+        lines.append("")
+
+    return lines
 
 
 def _format_status(row: ExperimentRow) -> str:
@@ -650,6 +854,9 @@ def render_markdown(rows: list[ExperimentRow], diseases: list[str]) -> str:
         mean_cells.append(f"**{_format_float(row.mean_auroc)}**")
     lines.append("| " + " | ".join(mean_cells) + " |")
     lines.append("")
+
+    # Optional diagnostics section for experiments with ``eval_dirs``.
+    lines.extend(_render_global_eval_diagnostics(rows, diseases))
 
     # Experiment details
     lines.append("## Experiment Details")
@@ -754,6 +961,21 @@ def render_readme_section(
     for row in rows:
         mean_cells.append(f"**{_format_float(row.mean_auroc)}**")
     lines.append("| " + " | ".join(mean_cells) + " |")
+
+    # Mirror render_markdown: append the diagnostics section when any
+    # experiment declared eval_dirs. In README the section uses ``###``
+    # subheadings (one level deeper) since the README block lives under a
+    # top-level ``## 实验进度`` heading.
+    diag_lines = _render_global_eval_diagnostics(rows, diseases)
+    if diag_lines:
+        # Demote ``##`` / ``###`` one level so nesting under README ``##`` works.
+        for line in diag_lines:
+            if line.startswith("## "):
+                lines.append("### " + line[3:])
+            elif line.startswith("### "):
+                lines.append("#### " + line[4:])
+            else:
+                lines.append(line)
 
     return "\n".join(lines)
 
