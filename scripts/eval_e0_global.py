@@ -26,6 +26,7 @@ import argparse
 import csv
 import json
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -194,19 +195,26 @@ def main() -> None:
         n_neg = len(labels) - n_pos
 
         try:
-            auc = roc_auc_score(labels, probs)
-        except ValueError:
-            auc = 0.0
+            auc = float(roc_auc_score(labels, probs))
+        except ValueError as e:
+            # Typically raised when ``labels`` is single-class on this eval set.
+            # Record NaN (rather than 0.0) so downstream aggregation can tell
+            # this apart from a legitimate low-but-nonzero AUC.
+            logger.warning("[%s] roc_auc_score failed (%s); recording NaN",
+                           disease_name, e)
+            auc = float("nan")
 
         results.append({
             "Disease": disease_name,
-            "Global_Val_AUC": round(auc, 4),
+            "Global_Val_AUC": auc if math.isnan(auc) else round(auc, 4),
             "N_Positive": n_pos,
             "N_Negative": n_neg,
             "Prevalence_pct": round(n_pos / len(labels) * 100, 2),
         })
-        logger.info("[%s] Global val AUC = %.4f  (pos=%d, neg=%d, prev=%.2f%%)",
-                     disease_name, auc, n_pos, n_neg, n_pos / len(labels) * 100)
+        logger.info("[%s] Global val AUC = %s  (pos=%d, neg=%d, prev=%.2f%%)",
+                     disease_name,
+                     "NaN" if math.isnan(auc) else f"{auc:.4f}",
+                     n_pos, n_neg, n_pos / len(labels) * 100)
 
         # Free GPU memory between diseases
         torch.cuda.empty_cache()
@@ -219,9 +227,22 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(results)
 
-        # Compute mean AUC
-        aucs = [r["Global_Val_AUC"] for r in results if r["Global_Val_AUC"] > 0]
-        mean_auc = sum(aucs) / len(aucs) if aucs else 0
+        # Average only over diseases with a valid (non-NaN) AUC. We deliberately
+        # track the excluded set and surface it in the log instead of silently
+        # filtering with ``> 0`` (which would conflate a failed roc_auc_score
+        # sentinel with a legitimate low AUC).
+        valid_aucs = [r["Global_Val_AUC"] for r in results
+                      if not (isinstance(r["Global_Val_AUC"], float)
+                              and math.isnan(r["Global_Val_AUC"]))]
+        excluded = [r["Disease"] for r in results
+                    if isinstance(r["Global_Val_AUC"], float)
+                    and math.isnan(r["Global_Val_AUC"])]
+        if excluded:
+            logger.warning(
+                "MEAN excludes %d disease(s) with invalid AUC: %s",
+                len(excluded), excluded,
+            )
+        mean_auc = sum(valid_aucs) / len(valid_aucs) if valid_aucs else float("nan")
         # Aggregate per-disease positives. ``results`` currently holds only the
         # per-disease rows — the MEAN entry is appended *after* the dict literal
         # is fully constructed, so we iterate ``results`` directly here rather

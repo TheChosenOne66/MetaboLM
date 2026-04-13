@@ -41,6 +41,7 @@ import argparse
 import csv
 import json
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -209,15 +210,28 @@ def main() -> None:
     parser.add_argument("--output-dir", default="outputs/E0_global_eval_cohort")
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument(
-        "--cohort-seed", type=int, default=42,
-        help="Seed passed to build_disease_cohort — must match the value used "
-             "at training time (default 42, see scripts/train.py).",
+        "--cohort-seed", type=int, default=None,
+        help="Seed passed to build_disease_cohort. Must match the seed used at "
+             "training time. If omitted, falls back to ``cfg.seed`` from the "
+             "config file (matches scripts/train.py:main, which passes "
+             "``cfg.seed`` into build_disease_cohort).",
     )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Device: %s", device)
+
+    # Resolve cohort seed: explicit CLI override > config > error.
+    cohort_seed = args.cohort_seed
+    if cohort_seed is None:
+        cohort_seed = getattr(cfg, "seed", None)
+    if cohort_seed is None:
+        raise ValueError(
+            "Cohort seed could not be resolved: pass --cohort-seed or set "
+            "``seed`` in the config file."
+        )
+    logger.info("Cohort seed (must match training): %d", cohort_seed)
 
     df, X_val, Y_val, feature_cols, label_cols = load_full_df_and_val(
         cfg.data.train_path, cfg.data.val_path,
@@ -241,7 +255,7 @@ def main() -> None:
         label_col = f"label_{disease_name}"
         stats = compute_cohort_train_stats(
             df, disease_name, label_col, feature_cols, label_cols,
-            seed=args.cohort_seed,
+            seed=cohort_seed,
         )
         if stats is None:
             logger.warning("[%s] build_disease_cohort returned None — skipping",
@@ -267,21 +281,27 @@ def main() -> None:
         n_neg = len(labels) - n_pos
 
         try:
-            auc = roc_auc_score(labels, probs)
-        except ValueError:
-            auc = 0.0
+            auc = float(roc_auc_score(labels, probs))
+        except ValueError as e:
+            # Typically raised when ``labels`` is single-class on this eval set.
+            # Record NaN (rather than 0.0) so downstream aggregation can tell
+            # this apart from a legitimate low-but-nonzero AUC.
+            logger.warning("[%s] roc_auc_score failed (%s); recording NaN",
+                           disease_name, e)
+            auc = float("nan")
 
         results.append({
             "Disease": disease_name,
-            "Global_Val_AUC_Own_Preproc": round(auc, 4),
+            "Global_Val_AUC_Own_Preproc": auc if math.isnan(auc) else round(auc, 4),
             "N_Positive": n_pos,
             "N_Negative": n_neg,
             "Prevalence_pct": round(n_pos / len(labels) * 100, 2),
         })
-        logger.info("[%s] Global val AUC (own preproc) = %.4f "
+        logger.info("[%s] Global val AUC (own preproc) = %s "
                     "(pos=%d, neg=%d, prev=%.2f%%)",
-                    disease_name, auc, n_pos, n_neg,
-                    n_pos / len(labels) * 100)
+                    disease_name,
+                    "NaN" if math.isnan(auc) else f"{auc:.4f}",
+                    n_pos, n_neg, n_pos / len(labels) * 100)
 
         torch.cuda.empty_cache()
 
@@ -292,9 +312,22 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(results)
 
-        aucs = [r["Global_Val_AUC_Own_Preproc"] for r in results
-                if r["Global_Val_AUC_Own_Preproc"] > 0]
-        mean_auc = sum(aucs) / len(aucs) if aucs else 0
+        # Average only over diseases with a valid (non-NaN) AUC. We deliberately
+        # track the excluded set and surface it in the log instead of silently
+        # filtering with ``> 0`` (which would conflate a failed roc_auc_score
+        # sentinel with a legitimate low AUC).
+        valid_aucs = [r["Global_Val_AUC_Own_Preproc"] for r in results
+                      if not (isinstance(r["Global_Val_AUC_Own_Preproc"], float)
+                              and math.isnan(r["Global_Val_AUC_Own_Preproc"]))]
+        excluded = [r["Disease"] for r in results
+                    if isinstance(r["Global_Val_AUC_Own_Preproc"], float)
+                    and math.isnan(r["Global_Val_AUC_Own_Preproc"])]
+        if excluded:
+            logger.warning(
+                "MEAN excludes %d disease(s) with invalid AUC: %s",
+                len(excluded), excluded,
+            )
+        mean_auc = sum(valid_aucs) / len(valid_aucs) if valid_aucs else float("nan")
         # Aggregate per-disease positives. ``results`` currently holds only the
         # per-disease rows — the MEAN entry is appended *after* the dict literal
         # is fully constructed, so we iterate ``results`` directly here rather
