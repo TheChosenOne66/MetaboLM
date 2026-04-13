@@ -43,10 +43,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.config import load_config  # noqa: E402
 from src.data.endpoints import get_disease_names  # noqa: E402
 
 logging.basicConfig(
@@ -56,26 +56,57 @@ logging.basicConfig(
 logger = logging.getLogger("cross_disease_matrix")
 
 
-def load_labels(eval_dir: Path, disease_names: list[str]) -> pd.DataFrame:
-    """Load ``eval_set_labels.csv`` and return a DataFrame indexed by eid."""
-    labels_path = eval_dir / "eval_set_labels.csv"
-    if not labels_path.exists():
-        raise FileNotFoundError(
-            f"{labels_path} not found. Was it produced by an up-to-date "
-            f"eval_e0_global*.py run?"
-        )
-    df = pd.read_csv(labels_path)
-    if "eid" not in df.columns:
-        raise ValueError(f"{labels_path} missing 'eid' column")
+def build_labels_from_val_csv(val_path: str, disease_names: list[str]) -> pd.DataFrame:
+    """Load labels from val.csv and return a DataFrame indexed by eid."""
     label_cols = [f"label_{d}" for d in disease_names]
+    df = pd.read_csv(val_path)
+    if "eid" not in df.columns:
+        raise ValueError(f"{val_path} missing 'eid' column")
     missing = [c for c in label_cols if c not in df.columns]
     if missing:
-        raise ValueError(f"{labels_path} missing label columns: {missing[:3]}...")
-
+        raise ValueError(f"{val_path} missing label columns: {missing[:3]}...")
     df = df.set_index("eid")
-    logger.info("Loaded labels: %d samples × %d label columns",
+    logger.info("Loaded labels from val.csv: %d samples × %d label columns",
                 len(df), len(label_cols))
     return df[label_cols]
+
+
+def write_eval_set_labels_sidecar(
+    eval_dir: Path, labels_df: pd.DataFrame, disease_names: list[str],
+) -> None:
+    """Persist eval-set labels alongside the eval outputs for future reuse."""
+    labels_path = eval_dir / "eval_set_labels.csv"
+    with labels_path.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["eid"] + [f"label_{d}" for d in disease_names])
+        for eid, row in labels_df.iterrows():
+            writer.writerow([eid] + [int(row[f"label_{d}"]) for d in disease_names])
+    logger.info("Wrote %s", labels_path)
+
+
+def load_labels(eval_dir: Path, disease_names: list[str], config_path: str) -> pd.DataFrame:
+    """Load ``eval_set_labels.csv`` or reconstruct it from val.csv."""
+    labels_path = eval_dir / "eval_set_labels.csv"
+    if labels_path.exists():
+        df = pd.read_csv(labels_path)
+        if "eid" not in df.columns:
+            raise ValueError(f"{labels_path} missing 'eid' column")
+        label_cols = [f"label_{d}" for d in disease_names]
+        missing = [c for c in label_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"{labels_path} missing label columns: {missing[:3]}...")
+
+        df = df.set_index("eid")
+        logger.info("Loaded labels: %d samples × %d label columns",
+                    len(df), len(label_cols))
+        return df[label_cols]
+
+    cfg = load_config(config_path)
+    logger.warning("%s not found; reconstructing labels from %s",
+                   labels_path, cfg.data.val_path)
+    labels_df = build_labels_from_val_csv(cfg.data.val_path, disease_names)
+    write_eval_set_labels_sidecar(eval_dir, labels_df, disease_names)
+    return labels_df
 
 
 def load_predictions(
@@ -97,11 +128,31 @@ def load_predictions(
 
 
 def compute_auc_safe(y_true: np.ndarray, y_score: np.ndarray) -> float:
-    """``roc_auc_score`` with NaN sentinel on single-class labels."""
-    try:
-        return float(roc_auc_score(y_true, y_score))
-    except ValueError:
+    """Binary AUROC with NaN sentinel on single-class labels."""
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_score = np.asarray(y_score, dtype=np.float64)
+    pos = y_true == 1
+    neg = y_true == 0
+    n_pos = int(pos.sum())
+    n_neg = int(neg.sum())
+    if n_pos == 0 or n_neg == 0:
         return float("nan")
+    order = np.argsort(y_score, kind="mergesort")
+    sorted_scores = y_score[order]
+    ranks = np.empty(len(sorted_scores), dtype=np.float64)
+    i = 0
+    while i < len(sorted_scores):
+        j = i + 1
+        while j < len(sorted_scores) and sorted_scores[j] == sorted_scores[i]:
+            j += 1
+        avg_rank = (i + j - 1) / 2.0 + 1.0
+        ranks[i:j] = avg_rank
+        i = j
+    full_ranks = np.empty(len(ranks), dtype=np.float64)
+    full_ranks[order] = ranks
+    pos_rank_sum = float(full_ranks[pos].sum())
+    auc = (pos_rank_sum - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+    return float(auc)
 
 
 def build_matrix(
@@ -217,11 +268,32 @@ def write_outputs(
     diag_values = [
         matrix.loc[c, c] for c in matrix.index if c in matrix.columns
     ]
+    off_diag_values = []
+    best_off_diag: tuple[str, str, float] | None = None
+    for ckpt_disease, row in matrix.iterrows():
+        for eval_label, auc in row.items():
+            if ckpt_disease == eval_label or pd.isna(auc):
+                continue
+            auc_float = float(auc)
+            off_diag_values.append(auc_float)
+            if best_off_diag is None or auc_float > best_off_diag[2]:
+                best_off_diag = (ckpt_disease, str(eval_label), auc_float)
     summary = {
         "n_ckpts_present": int(len(matrix)),
         "n_labels": int(matrix.shape[1]),
         "n_total_eval_samples": int(n_total),
         "diagonal_mean_auc": _none_if_nan(_safe_mean(diag_values)),
+        "off_diagonal_global_mean_auc": _none_if_nan(_safe_mean(off_diag_values)),
+        "diagonal_minus_off_diagonal_gap": _none_if_nan(
+            _safe_mean(diag_values) - _safe_mean(off_diag_values)
+        ),
+        "best_off_diagonal_pair": (
+            None if best_off_diag is None else {
+                "ckpt_disease": best_off_diag[0],
+                "eval_label": best_off_diag[1],
+                "auc": round(best_off_diag[2], 4),
+            }
+        ),
         "per_ckpt": {},
     }
     for ckpt_disease, row in matrix.iterrows():
@@ -304,9 +376,13 @@ def main() -> int:
              "(e.g. outputs/E0_global_eval or outputs/E0_global_eval_cohort).",
     )
     parser.add_argument(
+        "--config", default="configs/reproduce.yaml",
+        help="Config used to resolve val.csv when eval_set_labels.csv is absent.",
+    )
+    parser.add_argument(
         "--output-dir", default=None,
         help="Where to write cross_disease_matrix.csv etc. Defaults to "
-             "``--eval-dir`` (writes alongside the per-ckpt subdirs).",
+            "``--eval-dir`` (writes alongside the per-ckpt subdirs).",
     )
     args = parser.parse_args()
 
@@ -318,7 +394,7 @@ def main() -> int:
     output_dir = Path(args.output_dir) if args.output_dir else eval_dir
 
     disease_names = get_disease_names()
-    labels_df = load_labels(eval_dir, disease_names)
+    labels_df = load_labels(eval_dir, disease_names, args.config)
 
     matrix, n_pos_lookup = build_matrix(eval_dir, disease_names, labels_df)
     if matrix.empty:

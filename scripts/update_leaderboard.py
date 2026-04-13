@@ -95,6 +95,7 @@ class ExperimentRow:
     # variant was not declared in the manifest or its output dir was absent.
     eval_variant_mean_auroc: dict[str, float | None] = field(default_factory=dict)
     eval_variant_per_disease_auroc: dict[str, dict[str, float]] = field(default_factory=dict)
+    eval_variant_cross_disease_summary: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # Metadata
     num_completed_diseases: int | None = None  # E0 only
@@ -560,6 +561,26 @@ def parse_global_eval_dir(
     return per_disease, mean_auroc
 
 
+def parse_cross_disease_summary(eval_dir: Path) -> dict[str, Any] | None:
+    """Parse optional cross-disease matrix summary for one eval dir."""
+    summary_path = Path(eval_dir) / "cross_disease_summary.json"
+    if not summary_path.exists():
+        return None
+    try:
+        with open(summary_path, "r") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(
+            f"[WARN] parse_cross_disease_summary({summary_path.parent.name}): "
+            f"JSON parse error ({e}); skipping",
+            file=sys.stderr,
+        )
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
 def collect_experiment_rows(
     manifest: Manifest, repo_root: Path
 ) -> list[ExperimentRow]:
@@ -598,11 +619,15 @@ def collect_experiment_rows(
         # the variant just shows up as a dash in the rendered diagnostics.
         eval_variant_mean: dict[str, float | None] = {}
         eval_variant_per_disease: dict[str, dict[str, float]] = {}
+        eval_variant_cross_disease_summary: dict[str, dict[str, Any]] = {}
         for variant_label, variant_dir in entry.eval_dirs.items():
             resolved = resolve_output_dir(variant_dir, repo_root)
             per_disease, mean_auc = parse_global_eval_dir(resolved, manifest.diseases)
             eval_variant_mean[variant_label] = mean_auc
             eval_variant_per_disease[variant_label] = per_disease
+            cross_disease_summary = parse_cross_disease_summary(resolved)
+            if cross_disease_summary is not None:
+                eval_variant_cross_disease_summary[variant_label] = cross_disease_summary
 
         row = ExperimentRow(
             id=entry.id,
@@ -625,6 +650,7 @@ def collect_experiment_rows(
             per_disease_auprc=parsed["per_disease_auprc"],
             eval_variant_mean_auroc=eval_variant_mean,
             eval_variant_per_disease_auroc=eval_variant_per_disease,
+            eval_variant_cross_disease_summary=eval_variant_cross_disease_summary,
             num_completed_diseases=parsed["num_completed_diseases"],
             total_diseases=len(manifest.diseases),
             error_message=parsed["error_message"],
@@ -732,8 +758,38 @@ def _render_global_eval_diagnostics(
             lines.append(f"| {display} | {_format_float(mean_auc)} |")
         lines.append("")
 
-        # Per-disease table: one column for the primary, one per variant
         variant_labels = list(row.eval_variant_mean_auroc.keys())
+        cross_disease_variants = [
+            v for v in variant_labels
+            if row.eval_variant_cross_disease_summary.get(v)
+        ]
+        if cross_disease_variants:
+            lines.append("**Cross-Disease 16×16 Matrix Summary**")
+            lines.append("")
+            lines.append(
+                "| Eval Mode | Diagonal Mean | Off-Diagonal Mean | Gap | Strongest Off-Diagonal |"
+            )
+            lines.append("|---|:---:|:---:|:---:|---|")
+            for variant_label in cross_disease_variants:
+                display = _EVAL_VARIANT_DISPLAY.get(variant_label, variant_label)
+                summary = row.eval_variant_cross_disease_summary[variant_label]
+                best_pair = summary.get("best_off_diagonal_pair") or {}
+                best_pair_text = "—"
+                if best_pair:
+                    best_pair_text = (
+                        f"`{best_pair.get('ckpt_disease')}→{best_pair.get('eval_label')}` "
+                        f"({_format_float(best_pair.get('auc'))})"
+                    )
+                lines.append(
+                    f"| {display} | "
+                    f"{_format_float(summary.get('diagonal_mean_auc'))} | "
+                    f"{_format_float(summary.get('off_diagonal_global_mean_auc'))} | "
+                    f"{_format_float(summary.get('diagonal_minus_off_diagonal_gap'))} | "
+                    f"{best_pair_text} |"
+                )
+            lines.append("")
+
+        # Per-disease table: one column for the primary, one per variant
         header_cells = ["Disease", "Primary"] + [
             _EVAL_VARIANT_DISPLAY.get(v, v) for v in variant_labels
         ]
