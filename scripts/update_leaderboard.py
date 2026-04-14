@@ -81,7 +81,12 @@ class ExperimentRow:
     status: ExperimentStatus = ExperimentStatus.PLANNED
     mean_auroc: float | None = None
     mean_auprc: float | None = None
-    hierarchy_violation_rate: float | None = None
+    # Two HVR variants — see docs/superpowers/plans/2026-04-13-hierarchy-violation-eval.md
+    # (Revision 2, "Option B"). ``_mean`` is computed by mean-aggregating the
+    # leaf-head probs and is comparable across E0 / E1-E4. ``_head`` is from
+    # the explicit chapter head, only defined for multitask models.
+    hierarchy_violation_rate_mean: float | None = None
+    hierarchy_violation_rate_head: float | None = None
     trainable_params: int | None = None
     total_params: int | None = None
     freeze_strategy: str | None = None
@@ -222,6 +227,32 @@ def load_manifest(path: Path) -> Manifest:
 
 # ── Parsers ───────────────────────────────────────────────────────────────
 
+
+def _read_hvr_sidecar(path: Path, *, context: str) -> float | None:
+    """Read ``hierarchy_violation_rate`` from a sidecar JSON, or return None.
+
+    Shared by ``parse_per_disease_sft`` (reads ``_mean``) and
+    ``parse_multitask`` (reads both ``_mean`` and ``_head``). Returns None
+    when the file is absent OR unreadable — a malformed sidecar should not
+    blow up the whole leaderboard regen, just warn.
+
+    ``context`` is prepended to any warning so the log points at the exp dir
+    that produced the bad file.
+    """
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+        return float(payload.get("hierarchy_violation_rate"))
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        print(
+            f"[WARN] {context}: {path.name} unreadable ({exc}); "
+            f"treating HVR as missing",
+            file=sys.stderr,
+        )
+        return None
+
+
 def parse_per_disease_sft(
     exp_dir: Path, canonical_diseases: list[str]
 ) -> dict[str, Any]:
@@ -237,7 +268,8 @@ def parse_per_disease_sft(
         "status": ExperimentStatus.PLANNED,
         "mean_auroc": None,
         "mean_auprc": None,
-        "hierarchy_violation_rate": None,
+        "hierarchy_violation_rate_mean": None,
+        "hierarchy_violation_rate_head": None,
         "per_disease_auroc": {},
         "per_disease_auprc": {},
         "trainable_params": None,
@@ -346,11 +378,20 @@ def parse_per_disease_sft(
         else ExperimentStatus.PARTIAL
     )
 
+    # Read the HVR (mean) sidecar produced by
+    # scripts/eval_hierarchy_violation.py e0-mean. Only ``_mean`` is defined
+    # for E0 (no chapter head exists to derive ``_head`` from).
+    hvr_mean = _read_hvr_sidecar(
+        exp_dir / "hierarchy_violation_mean.json",
+        context=f"parse_per_disease_sft({exp_dir.name})",
+    )
+
     return {
         "status": status,
         "mean_auroc": mean_auroc,
         "mean_auprc": None,  # E0 CSV has no AUPRC
-        "hierarchy_violation_rate": None,
+        "hierarchy_violation_rate_mean": hvr_mean,
+        "hierarchy_violation_rate_head": None,
         "per_disease_auroc": per_disease_auroc,
         "per_disease_auprc": {},
         "trainable_params": None,  # E0 hardcoded size, not in CSV
@@ -379,7 +420,8 @@ def parse_multitask(
         "status": ExperimentStatus.PLANNED,
         "mean_auroc": None,
         "mean_auprc": None,
-        "hierarchy_violation_rate": None,
+        "hierarchy_violation_rate_mean": None,
+        "hierarchy_violation_rate_head": None,
         "per_disease_auroc": {},
         "per_disease_auprc": {},
         "trainable_params": None,
@@ -468,11 +510,32 @@ def parse_multitask(
         except (ValueError, TypeError):
             return None
 
+    # HVR (mean) and HVR (head) sidecars produced by
+    # scripts/eval_hierarchy_violation.py multitask. Both optional — a
+    # pre-sidecar training run still records HVR in summary.json, which we
+    # treat as ``_head`` since the training objective used the chapter head.
+    hvr_mean = _read_hvr_sidecar(
+        exp_dir / "hierarchy_violation_mean.json",
+        context=f"parse_multitask({exp_dir.name})",
+    )
+    hvr_head = _read_hvr_sidecar(
+        exp_dir / "hierarchy_violation_head.json",
+        context=f"parse_multitask({exp_dir.name})",
+    )
+    if hvr_head is None:
+        legacy = summary.get("hierarchy_violation_rate")
+        if legacy is not None:
+            try:
+                hvr_head = float(legacy)
+            except (TypeError, ValueError):
+                pass
+
     return {
         "status": ExperimentStatus.COMPLETED,
         "mean_auroc": mean_auroc,
         "mean_auprc": None,  # Not emitted by current trainers
-        "hierarchy_violation_rate": summary.get("hierarchy_violation_rate"),
+        "hierarchy_violation_rate_mean": hvr_mean,
+        "hierarchy_violation_rate_head": hvr_head,
         "per_disease_auroc": per_disease_auroc,
         "per_disease_auprc": {},
         "trainable_params": _int_or_none(summary.get("trainable_params")),
@@ -603,7 +666,8 @@ def collect_experiment_rows(
                 "status": ExperimentStatus.ERROR,
                 "mean_auroc": None,
                 "mean_auprc": None,
-                "hierarchy_violation_rate": None,
+                "hierarchy_violation_rate_mean": None,
+                "hierarchy_violation_rate_head": None,
                 "per_disease_auroc": {},
                 "per_disease_auprc": {},
                 "trainable_params": None,
@@ -641,7 +705,8 @@ def collect_experiment_rows(
             status=parsed["status"],
             mean_auroc=parsed["mean_auroc"],
             mean_auprc=parsed["mean_auprc"],
-            hierarchy_violation_rate=parsed["hierarchy_violation_rate"],
+            hierarchy_violation_rate_mean=parsed["hierarchy_violation_rate_mean"],
+            hierarchy_violation_rate_head=parsed["hierarchy_violation_rate_head"],
             trainable_params=parsed["trainable_params"],
             total_params=parsed["total_params"],
             freeze_strategy=parsed["freeze_strategy"],
@@ -887,11 +952,11 @@ def render_markdown(rows: list[ExperimentRow], diseases: list[str]) -> str:
     lines.append("")
     lines.append(
         "| ID | Experiment | Phase | Status | Mean AUROC | "
-        "Mean AUPRC | Hier. Violation | Trainable Params | Best Epoch |"
+        "Mean AUPRC | HVR (mean) | HVR (head) | Trainable Params | Best Epoch |"
     )
     lines.append(
         "|----|-----------|:-----:|:------:|:----------:|:----------:|"
-        ":---------------:|:----------------:|:----------:|"
+        ":----------:|:----------:|:----------------:|:----------:|"
     )
     for row in rows:
         lines.append(
@@ -900,7 +965,8 @@ def render_markdown(rows: list[ExperimentRow], diseases: list[str]) -> str:
             f"{_format_status(row)} | "
             f"{_format_mean_with_partial_warning(row)} | "
             f"{_format_float(row.mean_auprc)} | "
-            f"{_format_float(row.hierarchy_violation_rate)} | "
+            f"{_format_float(row.hierarchy_violation_rate_mean)} | "
+            f"{_format_float(row.hierarchy_violation_rate_head)} | "
             f"{_format_params(row.trainable_params, row.total_params)} | "
             f"{row.best_epoch if row.best_epoch is not None else '—'} |"
         )
@@ -909,7 +975,10 @@ def render_markdown(rows: list[ExperimentRow], diseases: list[str]) -> str:
         "**Legend**: ✅ Done · ⚡ Partial · ⬜ Planned · ❌ Error · "
         "⚠️ = partial data, metric computed over completed diseases only · "
         "† = primary Mean AUROC is from a different eval regime than other "
-        "rows — see *Global-Val Diagnostics* below for apples-to-apples numbers"
+        "rows — see *Global-Val Diagnostics* below for apples-to-apples numbers · "
+        "HVR (mean) = P_chap from mean-aggregated leaf probs "
+        "(cross-model-comparable) · "
+        "HVR (head) = P_chap from explicit chapter head (multitask models only)"
     )
     lines.append("")
 
@@ -1004,11 +1073,11 @@ def render_readme_section(
     lines.append("")
     lines.append(
         "| ID | Experiment | Phase | Status | Mean AUROC | "
-        "Mean AUPRC | Hier. Violation | Trainable Params | Best Epoch |"
+        "Mean AUPRC | HVR (mean) | HVR (head) | Trainable Params | Best Epoch |"
     )
     lines.append(
         "|----|-----------|:-----:|:------:|:----------:|:----------:|"
-        ":---------------:|:----------------:|:----------:|"
+        ":----------:|:----------:|:----------------:|:----------:|"
     )
     for row in rows:
         lines.append(
@@ -1017,7 +1086,8 @@ def render_readme_section(
             f"{_format_status(row)} | "
             f"{_format_mean_with_partial_warning(row)} | "
             f"{_format_float(row.mean_auprc)} | "
-            f"{_format_float(row.hierarchy_violation_rate)} | "
+            f"{_format_float(row.hierarchy_violation_rate_mean)} | "
+            f"{_format_float(row.hierarchy_violation_rate_head)} | "
             f"{_format_params(row.trainable_params, row.total_params)} | "
             f"{row.best_epoch if row.best_epoch is not None else '—'} |"
         )
@@ -1026,7 +1096,10 @@ def render_readme_section(
         "**Legend**: ✅ Done · ⚡ Partial · ⬜ Planned · ❌ Error · "
         "⚠️ = partial data, metric computed over completed diseases only · "
         "† = primary Mean AUROC is from a different eval regime than other "
-        "rows — see *Global-Val Diagnostics* below for apples-to-apples numbers"
+        "rows — see *Global-Val Diagnostics* below for apples-to-apples numbers · "
+        "HVR (mean) = P_chap from mean-aggregated leaf probs "
+        "(cross-model-comparable) · "
+        "HVR (head) = P_chap from explicit chapter head (multitask models only)"
     )
     lines.append("")
 
