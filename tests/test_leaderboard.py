@@ -884,3 +884,101 @@ def test_render_readme_section_shows_two_hvr_columns():
     assert "HVR (mean)" in md
     assert "HVR (head)" in md
     assert "Hier. Violation" not in md
+
+
+# ── HVR coverage annotation (codex P2 round 3) ───────────────────────────
+
+def test_parse_multitask_surfaces_n_pairs_from_sidecar(tmp_path):
+    """Sidecar ``n_leaf_chapter_pairs`` is preserved into the parsed dict."""
+    exp_dir = tmp_path / "E1_coverage"
+    _minimal_multitask_files(exp_dir)
+    (exp_dir / "hierarchy_violation_mean.json").write_text(json.dumps({
+        "hierarchy_violation_rate": 0.15, "method": "mean_aggregate_multitask",
+        "n_samples": 1, "n_leaf_chapter_pairs": 16, "method_details": {},
+    }))
+    (exp_dir / "hierarchy_violation_head.json").write_text(json.dumps({
+        "hierarchy_violation_rate": 0.028, "method": "explicit_chapter_head",
+        "n_samples": 1, "n_leaf_chapter_pairs": 12, "method_details": {},
+    }))
+    r = ulb.parse_multitask(exp_dir, ["T2D"])
+    assert r["hierarchy_violation_n_pairs_mean"] == 16
+    assert r["hierarchy_violation_n_pairs_head"] == 12
+
+
+def test_parse_per_disease_sft_surfaces_partial_n_pairs(tmp_path):
+    """E0 baseline often runs partial (locally only T2D); n_pairs reflects that."""
+    exp_dir = tmp_path / "E0_partial"
+    exp_dir.mkdir()
+    (exp_dir / "finetune_summary_metrics.csv").write_text(
+        "Disease,Val_AUC,Best_Epoch\nT2D,0.85,5\n"
+    )
+    (exp_dir / "hierarchy_violation_mean.json").write_text(json.dumps({
+        "hierarchy_violation_rate": 0.0, "method": "mean_aggregate_baseline",
+        "n_samples": 84611, "n_leaf_chapter_pairs": 1, "method_details": {},
+    }))
+    r = ulb.parse_per_disease_sft(exp_dir, ["T2D"])
+    assert r["hierarchy_violation_rate_mean"] == pytest.approx(0.0)
+    assert r["hierarchy_violation_n_pairs_mean"] == 1
+    assert r["hierarchy_violation_n_pairs_head"] is None
+
+
+def test_parse_multitask_no_n_pairs_in_legacy_summary(tmp_path):
+    """Legacy summary.json HVR fallback has no coverage info; n_pairs stays None."""
+    exp_dir = tmp_path / "E1_legacy_cov"
+    _minimal_multitask_files(
+        exp_dir, extras_in_summary={"hierarchy_violation_rate": 0.042},
+    )
+    r = ulb.parse_multitask(exp_dir, ["T2D"])
+    assert r["hierarchy_violation_rate_head"] == pytest.approx(0.042)
+    # No way to know coverage of the legacy training-time HVR.
+    assert r["hierarchy_violation_n_pairs_head"] is None
+
+
+def test_format_hvr_full_coverage_no_annotation():
+    assert ulb._format_hvr(0.150, n_pairs=16, total=16) == "0.150"
+
+
+def test_format_hvr_partial_coverage_annotated():
+    assert ulb._format_hvr(0.000, n_pairs=1, total=16) == "0.000 (1/16)"
+
+
+def test_format_hvr_unknown_coverage_treated_as_full():
+    # Legacy fallback (summary.json) has no n_pairs — we presume full so as
+    # not to noisily annotate historical data that was almost certainly
+    # computed on the full eval set.
+    assert ulb._format_hvr(0.042, n_pairs=None, total=16) == "0.042"
+
+
+def test_format_hvr_none_value_renders_dash():
+    assert ulb._format_hvr(None, n_pairs=None, total=16) == "—"
+    assert ulb._format_hvr(None, n_pairs=16, total=16) == "—"
+
+
+def test_render_markdown_annotates_partial_hvr_coverage():
+    """E0 locally (T2D only → 1/16) must show ``(1/16)`` next to the rate."""
+    row = ulb.ExperimentRow(
+        id="E0", display_name="E0 — Partial HVR", phase="phase1",
+        exp_type=ulb.ExperimentType.PER_DISEASE_SFT,
+        config="configs/reproduce.yaml", output_dir="outputs/E0",
+        description="test", innovation=None,
+        status=ulb.ExperimentStatus.PARTIAL,
+        mean_auroc=0.866,
+        hierarchy_violation_rate_mean=0.0,
+        hierarchy_violation_n_pairs_mean=1,
+        num_completed_diseases=1,
+        per_disease_auroc={"T2D": 0.866},
+    )
+    md = ulb.render_markdown([row], CANONICAL_DISEASES)
+    assert "(1/16)" in md
+
+
+def test_render_markdown_full_coverage_no_annotation():
+    """Full coverage rows render plain rates with no (n/total) suffix."""
+    row = _make_completed_multitask_row("E1")
+    # Default _make_completed_multitask_row has n_pairs=None → presumed full.
+    # Explicitly set n_pairs=16 to exercise the equal-to-total branch.
+    row.hierarchy_violation_n_pairs_mean = 16
+    row.hierarchy_violation_n_pairs_head = 16
+    md = ulb.render_markdown([row], CANONICAL_DISEASES)
+    assert "(16/16)" not in md
+    assert "/16)" not in md
