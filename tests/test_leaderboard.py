@@ -982,3 +982,31 @@ def test_render_markdown_full_coverage_no_annotation():
     md = ulb.render_markdown([row], CANONICAL_DISEASES)
     assert "(16/16)" not in md
     assert "/16)" not in md
+
+
+def test_read_hvr_sidecar_tolerates_permission_denied(tmp_path, monkeypatch, capsys):
+    """Codex P2 on PR #6: OSError on read_text() must not crash the regen.
+
+    Simulate a file that passes ``exists()`` but whose ``read_text()``
+    raises OSError (permission denied, transient I/O, or a race where the
+    file disappeared). The helper must warn and return ``(None, None)``,
+    not propagate the exception up through leaderboard generation.
+    """
+    path = tmp_path / "hierarchy_violation_mean.json"
+    path.write_text("{}")  # Make exists() return True.
+
+    original_read_text = Path.read_text
+
+    def _raise_os_error(self, *args, **kwargs):
+        if self == path:
+            raise PermissionError(f"simulated EACCES on {self}")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _raise_os_error)
+    rate, n_pairs = ulb._read_hvr_sidecar(path, context="unit_test")
+    assert rate is None
+    assert n_pairs is None
+    # Warning was printed, not raised.
+    err = capsys.readouterr().err
+    assert "unreadable" in err
+    assert "simulated EACCES" in err

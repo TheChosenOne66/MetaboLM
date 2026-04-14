@@ -270,3 +270,50 @@ def test_run_e0_baseline_mode_partial_dir(tmp_path):
     assert pytest.approx(payload["hierarchy_violation_rate"], abs=1e-6) == 0.5
     # Provenance: predictions_source path is recorded
     assert "eval_dir" in payload["method_details"]["predictions_source"]
+
+
+# ── Critical-key predicates for ckpt load validation (codex P1 on PR #6) ─
+
+def test_critical_missing_keys_flags_backbone_params():
+    """Backbone params MUST be flagged as critical — this was the P1 bug.
+
+    Previously the filter only caught head / adapter / LoRA keys, so a
+    ckpt missing ``metabolite_model.expr_*`` or ``cls_token`` (backbone
+    parameters) was silently accepted, and HVR would run against random
+    backbone weights.
+    """
+    missing = [
+        "metabolite_model.expr_embedding.weight",  # Backbone
+        "metabolite_model.cls_token",              # Backbone
+        "metabolite_model.bert.encoder.layer.5.attention.output.dense.weight",
+        "head.leaf_head.weight",                   # Head
+        "metabolite_model.bias_matrix_full",       # Buffer — NOT critical
+    ]
+    critical = ehv._critical_missing_keys(missing)
+    assert "metabolite_model.expr_embedding.weight" in critical
+    assert "metabolite_model.cls_token" in critical
+    assert "head.leaf_head.weight" in critical
+    assert "metabolite_model.bias_matrix_full" not in critical
+
+
+def test_critical_missing_keys_empty_when_only_bias_matrix():
+    """Only ``bias_matrix_full`` missing → no critical misses (legit load)."""
+    critical = ehv._critical_missing_keys([
+        "metabolite_model.bias_matrix_full",
+    ])
+    assert critical == []
+
+
+def test_critical_unexpected_keys_flags_unexpected_head_and_encoder():
+    """Unexpected head / encoder-layer keys flagged (freeze-strategy mismatch)."""
+    unexpected = [
+        "head.leaf_head.weight",
+        "metabolite_model.bert.encoder.layer.3.adapter.down.weight",
+        "metabolite_model.bias_matrix_full",  # Buffer — NOT critical
+        "some.unrelated.key",                 # Not head/encoder — NOT critical
+    ]
+    critical = ehv._critical_unexpected_keys(unexpected)
+    assert "head.leaf_head.weight" in critical
+    assert any("adapter" in k for k in critical)
+    assert "metabolite_model.bias_matrix_full" not in critical
+    assert "some.unrelated.key" not in critical
