@@ -259,10 +259,14 @@ def _read_hvr_sidecar(
     """
     if not path.exists():
         return (None, None)
+    # OSError covers permission denied, transient I/O, and the race where
+    # the file disappears between ``exists()`` and ``read_text()``. The
+    # helper's contract promises fault tolerance — a single unreadable
+    # sidecar must NOT crash a full leaderboard regen. Codex P2 on PR #6.
     try:
         payload = json.loads(path.read_text())
         rate = float(payload.get("hierarchy_violation_rate"))
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+    except (json.JSONDecodeError, TypeError, ValueError, OSError) as exc:
         print(
             f"[WARN] {context}: {path.name} unreadable ({exc}); "
             f"treating HVR as missing",
