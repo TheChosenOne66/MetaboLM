@@ -306,54 +306,6 @@ python scripts/eval_pretrain.py \
 
 通过 masked metabolite reconstruction 验证预训练模型：随机遮盖 10% 代谢物，评估重建的 MSE / MAE / R² / Accuracy。
 
-## Nebula 提交
-
-这个仓库现在已经适配了 Nebula 的 `python entry.py` 提交模式，根目录新增了：
-
-- `do.sh`：本地生成 `nebula_task.json` 后再调用 `nebulactl run mdl`
-- `entry.py`：Nebula 容器内读取 `nebula_task.json`，再执行真正的训练/评测脚本
-- `cluster.json`：默认 1 卡 GPU / 8 CPU / 500G 内存
-
-先在本地导出 Nebula 所需环境变量：
-
-```bash
-export OSS_ACCESS_ID=...
-export OSS_ACCESS_KEY=...
-export OSS_BUCKET=dt-relation
-export OSS_ENDPOINT=oss-cn-hangzhou.aliyuncs.com
-export METABOLM_RUNTIME_ROOT=/path/to/your/shared/MetaboLM
-export METABOLM_OUTPUT_BASE=/path/to/your/shared/MetaboLM/outputs
-export QUEUE=dt_tcif_4090          # 可选
-export NEBULA_PROJECT=tcif_uuic    # 可选
-export ODPS_PROJECT=da_intern_dev  # 可选
-export WORKERS=1                   # 可选
-```
-
-常用提交方式：
-
-```bash
-bash do.sh smoke
-bash do.sh e0
-bash do.sh e0 --diseases T2D obesity
-bash do.sh e1
-bash do.sh e2
-bash do.sh e3
-bash do.sh e4
-bash do.sh e5
-bash do.sh e6
-bash do.sh prepare
-bash do.sh leaderboard
-```
-
-如果要跑自定义入口，也可以直接：
-
-```bash
-bash do.sh custom scripts/train_multitask.py --config configs/sft_lora.yaml
-```
-
-`do.sh` 会把任务信息写到根目录的 `nebula_task.json`，Nebula 侧统一通过 `python entry.py` 启动，因此不依赖 Nebula 是否透传命令行参数给 Python 进程。
-相对路径的 `data/...` 和 `weights/...` 会默认映射到 `METABOLM_RUNTIME_ROOT` 指向的共享目录；训练产物会写到 `METABOLM_OUTPUT_BASE`，例如 E0 单病任务会落到 `.../outputs/E0_reproduction/<disease>/`，运行日志会落到 `.../outputs/logs/`。具体机器路径应只保留在本地忽略文件或运行环境变量中，不要写入受版本控制的文件。
-
 ## 支持的 16 种疾病
 
 | 疾病 | ICD-10 | 疾病 | ICD-10 |
