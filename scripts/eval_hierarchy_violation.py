@@ -250,6 +250,22 @@ def run_e0_baseline_mode(
 
     leaf_probs, present = load_e0_leaf_probs(eval_dir, diseases)
 
+    # Fail loudly when NO disease predictions were found (e.g. eval_dir points
+    # at a stale / empty directory, or all predictions_ckpt_*.csv files have
+    # schema issues and were skipped). Previously this path produced
+    # ``hierarchy_violation_rate: 0.0`` over zero evaluated pairs, which
+    # renders indistinguishably from a legitimately-zero rate in the
+    # leaderboard. See codex review on PR #5.
+    if not present:
+        raise RuntimeError(
+            f"No disease predictions loaded from {eval_dir}. "
+            "Expected at least one <disease>/predictions_ckpt_<disease>.csv "
+            "file with columns (eid, prob_ckpt_<disease>). "
+            "Refusing to write a meaningless HVR=0.0 metric — run "
+            "scripts/eval_e0_global*.py first, or point --eval-dir at a "
+            "populated directory."
+        )
+
     # Drop missing diseases entirely so mean aggregation isn't poisoned by NaN.
     # The canonical metric only iterates the mapping we pass it, so limiting
     # the mapping to ``present`` diseases gives the correct "pairs evaluated"
@@ -373,13 +389,62 @@ def run_multitask_mode(
         num_diseases=len(disease_names),
         num_chapters=n_chapters,
     )
-    model = MetaboLMForClassification(backbone, head)
+    # IMPORTANT: instantiate the wrapper with the SAME freeze_strategy /
+    # adapter_bottleneck / lora_rank the checkpoint was trained with,
+    # otherwise adapter modules are never injected (they'd be silently
+    # dropped by strict=False) and LoRA's wrapped q/v projections
+    # (``*.original.*`` keys) don't exist on the plain ``nn.Linear`` sides
+    # of the backbone. HVR would then be computed against an effectively
+    # pretrained-only model. See codex review on PR #5.
+    model = MetaboLMForClassification(
+        backbone,
+        head,
+        freeze_strategy=cfg.model.freeze_strategy,
+        adapter_bottleneck=cfg.model.adapter_bottleneck,
+        lora_rank=cfg.model.lora_rank,
+    )
+    logger.info(
+        "Model: freeze_strategy=%s adapter_bottleneck=%d lora_rank=%d",
+        cfg.model.freeze_strategy,
+        cfg.model.adapter_bottleneck,
+        cfg.model.lora_rank,
+    )
 
     cleaned = {
         (k.replace("module.", "") if k.startswith("module.") else k): v
         for k, v in state_dict.items()
     }
-    model.load_state_dict(cleaned, strict=False)
+    # strict=False is still appropriate because the checkpoint may or may
+    # not include a ``bias_matrix_full`` buffer (we register it below), but
+    # we now verify that the core head + adapter/LoRA keys actually
+    # matched, so a stale config + ckpt mismatch is loud rather than
+    # silent.
+    load_report = model.load_state_dict(cleaned, strict=False)
+    unexpected_critical = [
+        k for k in load_report.unexpected_keys
+        if k.startswith(("head.", "metabolite_model.bert.encoder.layer"))
+        and "bias_matrix_full" not in k
+    ]
+    if unexpected_critical:
+        raise RuntimeError(
+            f"Unexpected keys in checkpoint that do not match the configured "
+            f"freeze_strategy={cfg.model.freeze_strategy!r}: "
+            f"{unexpected_critical[:5]}{'...' if len(unexpected_critical) > 5 else ''}. "
+            "Double-check --config matches the strategy used at training time."
+        )
+    missing_critical = [
+        k for k in load_report.missing_keys
+        if k.startswith("head.")
+        or ".adapter." in k
+        or (".query.lora_" in k or ".value.lora_" in k)
+    ]
+    if missing_critical:
+        raise RuntimeError(
+            f"Checkpoint is missing critical parameters for "
+            f"freeze_strategy={cfg.model.freeze_strategy!r}: "
+            f"{missing_critical[:5]}{'...' if len(missing_critical) > 5 else ''}. "
+            "Training config and eval config likely disagree."
+        )
     model.metabolite_model.register_buffer("bias_matrix_full", bias_matrix)
     model.to(device)
     model.eval()

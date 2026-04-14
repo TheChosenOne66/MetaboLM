@@ -168,6 +168,25 @@ def test_load_e0_leaf_probs_partial_dir():
     assert np.all(np.isnan(leaf_probs[:, hypertension_idx]))
 
 
+def test_run_e0_baseline_mode_empty_dir_raises(tmp_path):
+    """When NO predictions are found, refuse to write a fake HVR=0.0.
+
+    Codex P2 on PR #5: previously the script silently produced
+    ``hierarchy_violation_rate: 0.0`` over zero evaluated pairs, which
+    renders indistinguishably from a legitimately-zero rate.
+    """
+    # Empty eval dir: labels CSV exists but NO per-disease predictions.
+    eval_dir = tmp_path / "empty_eval_dir"
+    eval_dir.mkdir()
+    (eval_dir / "eval_set_labels.csv").write_text("eid\n1\n2\n3\n")
+
+    out_path = tmp_path / "should_not_be_written.json"
+    with pytest.raises(RuntimeError, match="No disease predictions loaded"):
+        ehv.run_e0_baseline_mode(eval_dir, out_path)
+    # And we really should NOT have written the output file.
+    assert not out_path.exists()
+
+
 def test_run_e0_baseline_mode_partial_dir(tmp_path):
     """End-to-end on the partial fixture: only T2D + obesity contribute.
 
