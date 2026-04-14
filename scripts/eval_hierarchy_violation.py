@@ -345,6 +345,38 @@ def run_e0_baseline_mode(
     )
 
 
+def _critical_missing_keys(missing_keys: list[str]) -> list[str]:
+    """Filter ``load_state_dict`` missing keys down to the critical ones.
+
+    "Critical" = every key EXCEPT the ``bias_matrix_full`` buffer, which
+    ``run_multitask_mode`` registers AFTER ``load_state_dict`` (so it's
+    legitimately missing from the state dict and not a sign of a broken
+    checkpoint). Any other missing key means the ckpt doesn't match the
+    configured architecture — refuse to proceed rather than run HVR
+    against randomly-initialised parameters.
+
+    Extracted into a helper so the predicate can be unit-tested without
+    needing a real checkpoint + GPU. Codex P1 on PR #6.
+    """
+    return [k for k in missing_keys if "bias_matrix_full" not in k]
+
+
+def _critical_unexpected_keys(unexpected_keys: list[str]) -> list[str]:
+    """Filter ``load_state_dict`` unexpected keys to critical ones.
+
+    Critical = any head / encoder-layer key that isn't the
+    ``bias_matrix_full`` buffer. These indicate the ckpt was trained with
+    a different freeze_strategy than the current config (e.g. ckpt has
+    adapter tensors but config says freeze_strategy="none"). Non-critical
+    unexpected keys (e.g. ``bias_matrix_full`` in the ckpt) are tolerated.
+    """
+    return [
+        k for k in unexpected_keys
+        if k.startswith(("head.", "metabolite_model.bert.encoder.layer"))
+        and "bias_matrix_full" not in k
+    ]
+
+
 def run_multitask_mode(
     config_path: Path,
     output_dir: Path,
@@ -467,11 +499,9 @@ def run_multitask_mode(
     # matched, so a stale config + ckpt mismatch is loud rather than
     # silent.
     load_report = model.load_state_dict(cleaned, strict=False)
-    unexpected_critical = [
-        k for k in load_report.unexpected_keys
-        if k.startswith(("head.", "metabolite_model.bert.encoder.layer"))
-        and "bias_matrix_full" not in k
-    ]
+    unexpected_critical = _critical_unexpected_keys(
+        list(load_report.unexpected_keys)
+    )
     if unexpected_critical:
         raise RuntimeError(
             f"Unexpected keys in checkpoint that do not match the configured "
@@ -479,18 +509,14 @@ def run_multitask_mode(
             f"{unexpected_critical[:5]}{'...' if len(unexpected_critical) > 5 else ''}. "
             "Double-check --config matches the strategy used at training time."
         )
-    missing_critical = [
-        k for k in load_report.missing_keys
-        if k.startswith("head.")
-        or ".adapter." in k
-        or (".query.lora_" in k or ".value.lora_" in k)
-    ]
+    missing_critical = _critical_missing_keys(list(load_report.missing_keys))
     if missing_critical:
         raise RuntimeError(
-            f"Checkpoint is missing critical parameters for "
-            f"freeze_strategy={cfg.model.freeze_strategy!r}: "
+            f"Checkpoint is missing {len(missing_critical)} parameter(s) "
+            f"under freeze_strategy={cfg.model.freeze_strategy!r}: "
             f"{missing_critical[:5]}{'...' if len(missing_critical) > 5 else ''}. "
-            "Training config and eval config likely disagree."
+            "Training config and eval config likely disagree — refusing "
+            "to compute HVR against a partially-random model."
         )
     model.metabolite_model.register_buffer("bias_matrix_full", bias_matrix)
     model.to(device)
