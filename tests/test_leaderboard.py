@@ -1,7 +1,10 @@
 """Tests for scripts/update_leaderboard.py."""
 
+import json
 import sys
 from pathlib import Path
+
+import pytest
 
 # Make repo root importable for `scripts` and `tests` paths
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -332,7 +335,8 @@ def _make_completed_multitask_row(id="E1"):
         status=ulb.ExperimentStatus.COMPLETED,
         mean_auroc=0.8472,
         mean_auprc=0.3215,
-        hierarchy_violation_rate=0.028,
+        hierarchy_violation_rate_mean=0.150,
+        hierarchy_violation_rate_head=0.028,
         trainable_params=85123456,
         total_params=85123456,
         freeze_strategy="none",
@@ -748,3 +752,233 @@ diseases:
     exit_code = ulb.main()
     assert exit_code == 0
     assert readme_path.read_text() == original
+
+
+# ── HVR sidecar reads + two-column rendering (option B) ──────────────────
+
+def _minimal_multitask_files(exp_dir: Path, extras_in_summary: dict | None = None):
+    """Write the minimum files parse_multitask needs so it returns COMPLETED
+    instead of PLANNED, plus any extra keys in summary.json."""
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    (exp_dir / "multitask_metrics.csv").write_text(
+        "Disease,Val_AUC,Val_F1\nT2D,0.75,0.5\nMEAN,0.75,0.5\n"
+    )
+    summary = {
+        "experiment": "E1", "freeze_strategy": "none",
+        "best_epoch": 10, "best_mean_auc": 0.75,
+        "trainable_params": 100, "total_params": 100,
+    }
+    if extras_in_summary:
+        summary.update(extras_in_summary)
+    (exp_dir / "summary.json").write_text(json.dumps(summary))
+
+
+def _hvr_payload(rate: float, method: str) -> str:
+    return json.dumps({
+        "hierarchy_violation_rate": rate, "method": method,
+        "n_samples": 1, "n_leaf_chapter_pairs": 16, "method_details": {},
+    })
+
+
+def test_parse_multitask_reads_both_hvr_jsons(tmp_path):
+    """Both ``_mean`` and ``_head`` sidecars populate their respective fields."""
+    exp_dir = tmp_path / "E1_test"
+    _minimal_multitask_files(exp_dir)
+    (exp_dir / "hierarchy_violation_mean.json").write_text(
+        _hvr_payload(0.15, "mean_aggregate_multitask")
+    )
+    (exp_dir / "hierarchy_violation_head.json").write_text(
+        _hvr_payload(0.028, "explicit_chapter_head")
+    )
+    r = ulb.parse_multitask(exp_dir, ["T2D"])
+    assert r["hierarchy_violation_rate_mean"] == pytest.approx(0.15)
+    assert r["hierarchy_violation_rate_head"] == pytest.approx(0.028)
+
+
+def test_parse_multitask_falls_back_to_summary_for_head(tmp_path):
+    """Pre-sidecar runs dumped HVR in summary.json; treat as head metric."""
+    exp_dir = tmp_path / "E1_legacy"
+    _minimal_multitask_files(
+        exp_dir, extras_in_summary={"hierarchy_violation_rate": 0.042},
+    )
+    r = ulb.parse_multitask(exp_dir, ["T2D"])
+    assert r["hierarchy_violation_rate_mean"] is None
+    assert r["hierarchy_violation_rate_head"] == pytest.approx(0.042)
+
+
+def test_parse_multitask_no_hvr_sources_gives_none(tmp_path):
+    """Absent sidecars + no legacy summary key → both HVR fields are None."""
+    exp_dir = tmp_path / "E1_no_hvr"
+    _minimal_multitask_files(exp_dir)
+    r = ulb.parse_multitask(exp_dir, ["T2D"])
+    assert r["hierarchy_violation_rate_mean"] is None
+    assert r["hierarchy_violation_rate_head"] is None
+
+
+def test_parse_multitask_sidecar_wins_over_summary(tmp_path):
+    """Sidecar JSON takes priority over summary.json's legacy field."""
+    exp_dir = tmp_path / "E1_both"
+    _minimal_multitask_files(
+        exp_dir, extras_in_summary={"hierarchy_violation_rate": 0.999},
+    )
+    (exp_dir / "hierarchy_violation_head.json").write_text(
+        _hvr_payload(0.028, "explicit_chapter_head")
+    )
+    r = ulb.parse_multitask(exp_dir, ["T2D"])
+    assert r["hierarchy_violation_rate_head"] == pytest.approx(0.028)
+
+
+def test_parse_multitask_handles_malformed_sidecar(tmp_path):
+    """A corrupt sidecar is warned about, not fatal; HVR just stays None."""
+    exp_dir = tmp_path / "E1_bad"
+    _minimal_multitask_files(exp_dir)
+    (exp_dir / "hierarchy_violation_mean.json").write_text("{not valid json")
+    r = ulb.parse_multitask(exp_dir, ["T2D"])
+    assert r["hierarchy_violation_rate_mean"] is None
+    # Still returns COMPLETED — the main metrics are fine.
+    assert r["status"] == ulb.ExperimentStatus.COMPLETED
+
+
+def test_parse_per_disease_sft_reads_hvr_mean_json(tmp_path):
+    """E0 parser reads only ``_mean`` sidecar; ``_head`` stays None (no chapter head)."""
+    exp_dir = tmp_path / "E0_test"
+    exp_dir.mkdir()
+    (exp_dir / "finetune_summary_metrics.csv").write_text(
+        "Disease,Val_AUC,Best_Epoch\nT2D,0.85,5\n"
+    )
+    (exp_dir / "hierarchy_violation_mean.json").write_text(
+        _hvr_payload(0.37, "mean_aggregate_baseline")
+    )
+    r = ulb.parse_per_disease_sft(exp_dir, ["T2D"])
+    assert r["hierarchy_violation_rate_mean"] == pytest.approx(0.37)
+    assert r["hierarchy_violation_rate_head"] is None
+
+
+def test_parse_per_disease_sft_without_hvr_sidecar(tmp_path):
+    exp_dir = tmp_path / "E0_no_hvr"
+    exp_dir.mkdir()
+    (exp_dir / "finetune_summary_metrics.csv").write_text(
+        "Disease,Val_AUC,Best_Epoch\nT2D,0.85,5\n"
+    )
+    r = ulb.parse_per_disease_sft(exp_dir, ["T2D"])
+    assert r["hierarchy_violation_rate_mean"] is None
+    assert r["hierarchy_violation_rate_head"] is None
+
+
+def test_render_markdown_shows_two_hvr_columns():
+    rows = [_make_completed_multitask_row("E1")]
+    md = ulb.render_markdown(rows, CANONICAL_DISEASES)
+    # New column headers present
+    assert "HVR (mean)" in md
+    assert "HVR (head)" in md
+    # Old single header is gone
+    assert "Hier. Violation" not in md
+    # Both values render (0.150 and 0.028 from _make_completed_multitask_row)
+    assert "0.150" in md
+    assert "0.028" in md
+
+
+def test_render_readme_section_shows_two_hvr_columns():
+    rows = [_make_completed_multitask_row("E1")]
+    md = ulb.render_readme_section(rows, CANONICAL_DISEASES)
+    assert "HVR (mean)" in md
+    assert "HVR (head)" in md
+    assert "Hier. Violation" not in md
+
+
+# ── HVR coverage annotation (codex P2 round 3) ───────────────────────────
+
+def test_parse_multitask_surfaces_n_pairs_from_sidecar(tmp_path):
+    """Sidecar ``n_leaf_chapter_pairs`` is preserved into the parsed dict."""
+    exp_dir = tmp_path / "E1_coverage"
+    _minimal_multitask_files(exp_dir)
+    (exp_dir / "hierarchy_violation_mean.json").write_text(json.dumps({
+        "hierarchy_violation_rate": 0.15, "method": "mean_aggregate_multitask",
+        "n_samples": 1, "n_leaf_chapter_pairs": 16, "method_details": {},
+    }))
+    (exp_dir / "hierarchy_violation_head.json").write_text(json.dumps({
+        "hierarchy_violation_rate": 0.028, "method": "explicit_chapter_head",
+        "n_samples": 1, "n_leaf_chapter_pairs": 12, "method_details": {},
+    }))
+    r = ulb.parse_multitask(exp_dir, ["T2D"])
+    assert r["hierarchy_violation_n_pairs_mean"] == 16
+    assert r["hierarchy_violation_n_pairs_head"] == 12
+
+
+def test_parse_per_disease_sft_surfaces_partial_n_pairs(tmp_path):
+    """E0 baseline often runs partial (locally only T2D); n_pairs reflects that."""
+    exp_dir = tmp_path / "E0_partial"
+    exp_dir.mkdir()
+    (exp_dir / "finetune_summary_metrics.csv").write_text(
+        "Disease,Val_AUC,Best_Epoch\nT2D,0.85,5\n"
+    )
+    (exp_dir / "hierarchy_violation_mean.json").write_text(json.dumps({
+        "hierarchy_violation_rate": 0.0, "method": "mean_aggregate_baseline",
+        "n_samples": 84611, "n_leaf_chapter_pairs": 1, "method_details": {},
+    }))
+    r = ulb.parse_per_disease_sft(exp_dir, ["T2D"])
+    assert r["hierarchy_violation_rate_mean"] == pytest.approx(0.0)
+    assert r["hierarchy_violation_n_pairs_mean"] == 1
+    assert r["hierarchy_violation_n_pairs_head"] is None
+
+
+def test_parse_multitask_no_n_pairs_in_legacy_summary(tmp_path):
+    """Legacy summary.json HVR fallback has no coverage info; n_pairs stays None."""
+    exp_dir = tmp_path / "E1_legacy_cov"
+    _minimal_multitask_files(
+        exp_dir, extras_in_summary={"hierarchy_violation_rate": 0.042},
+    )
+    r = ulb.parse_multitask(exp_dir, ["T2D"])
+    assert r["hierarchy_violation_rate_head"] == pytest.approx(0.042)
+    # No way to know coverage of the legacy training-time HVR.
+    assert r["hierarchy_violation_n_pairs_head"] is None
+
+
+def test_format_hvr_full_coverage_no_annotation():
+    assert ulb._format_hvr(0.150, n_pairs=16, total=16) == "0.150"
+
+
+def test_format_hvr_partial_coverage_annotated():
+    assert ulb._format_hvr(0.000, n_pairs=1, total=16) == "0.000 (1/16)"
+
+
+def test_format_hvr_unknown_coverage_treated_as_full():
+    # Legacy fallback (summary.json) has no n_pairs — we presume full so as
+    # not to noisily annotate historical data that was almost certainly
+    # computed on the full eval set.
+    assert ulb._format_hvr(0.042, n_pairs=None, total=16) == "0.042"
+
+
+def test_format_hvr_none_value_renders_dash():
+    assert ulb._format_hvr(None, n_pairs=None, total=16) == "—"
+    assert ulb._format_hvr(None, n_pairs=16, total=16) == "—"
+
+
+def test_render_markdown_annotates_partial_hvr_coverage():
+    """E0 locally (T2D only → 1/16) must show ``(1/16)`` next to the rate."""
+    row = ulb.ExperimentRow(
+        id="E0", display_name="E0 — Partial HVR", phase="phase1",
+        exp_type=ulb.ExperimentType.PER_DISEASE_SFT,
+        config="configs/reproduce.yaml", output_dir="outputs/E0",
+        description="test", innovation=None,
+        status=ulb.ExperimentStatus.PARTIAL,
+        mean_auroc=0.866,
+        hierarchy_violation_rate_mean=0.0,
+        hierarchy_violation_n_pairs_mean=1,
+        num_completed_diseases=1,
+        per_disease_auroc={"T2D": 0.866},
+    )
+    md = ulb.render_markdown([row], CANONICAL_DISEASES)
+    assert "(1/16)" in md
+
+
+def test_render_markdown_full_coverage_no_annotation():
+    """Full coverage rows render plain rates with no (n/total) suffix."""
+    row = _make_completed_multitask_row("E1")
+    # Default _make_completed_multitask_row has n_pairs=None → presumed full.
+    # Explicitly set n_pairs=16 to exercise the equal-to-total branch.
+    row.hierarchy_violation_n_pairs_mean = 16
+    row.hierarchy_violation_n_pairs_head = 16
+    md = ulb.render_markdown([row], CANONICAL_DISEASES)
+    assert "(16/16)" not in md
+    assert "/16)" not in md

@@ -1,0 +1,4 @@
+eid,label_T2D,label_obesity,label_hypertension,label_ischemic_heart,label_atrial_fib,label_heart_failure,label_rheumatoid,label_asthma,label_dementia,label_copd,label_stroke,label_parkinsons,label_breast_cancer,label_colon_cancer,label_lung_cancer,label_prostate_cancer
+1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+2,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+3,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0
