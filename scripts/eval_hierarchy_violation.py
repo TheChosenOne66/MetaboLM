@@ -210,11 +210,33 @@ def load_e0_leaf_probs(
         # (int eids become floats and stringify as "1.0", breaking the join).
         pred_eids = pred_df["eid"].astype(str).tolist()
         pred_vals = pred_df[prob_col].astype(float).tolist()
+        n_aligned = 0
         for eid_str, val in zip(pred_eids, pred_vals):
             i = eid_to_row.get(eid_str)
             if i is None:
                 continue
             leaf_probs[i, col_idx] = val
+            n_aligned += 1
+        # Mark the disease as present ONLY if at least one prediction row
+        # actually aligned with eval_set_labels.csv. A stale/format-drifted
+        # file (e.g. eids as ``1.0`` instead of ``1``) would otherwise slip
+        # through as an all-NaN column, and the canonical metric would treat
+        # every NaN > P_chap comparison as False — silently deflating HVR.
+        # Codex P2 on PR #5 (2026-04-14 round 2).
+        if n_aligned == 0:
+            logger.warning(
+                "[%s] %s has %d rows but NONE aligned with eval_set_labels.csv "
+                "(eid mismatch — stale file or dtype drift?); skipping disease",
+                disease, pred_path.name, len(pred_eids),
+            )
+            continue
+        if n_aligned < len(eids):
+            logger.warning(
+                "[%s] only %d/%d eids in eval_set_labels.csv got a prediction; "
+                "unaligned rows will be NaN and will fail the no-NaN check "
+                "in run_e0_baseline_mode",
+                disease, n_aligned, len(eids),
+            )
         present.append(disease)
     return leaf_probs, present
 
@@ -273,6 +295,26 @@ def run_e0_baseline_mode(
     # ``n_leaf_chapter_pairs = len(disease_to_chapter_idx)`` semantics).
     present_idx = [diseases.index(d) for d in present]
     leaf_probs_clean = leaf_probs[:, present_idx]
+    # Defense-in-depth against the same "silent NaN deflates HVR" class of
+    # bug flagged by codex P2 (round 2). load_e0_leaf_probs drops diseases
+    # with zero aligned eids; partial alignment still leaves NaN cells in
+    # otherwise-present columns. Either way, a NaN reaching the canonical
+    # metric turns into ``NaN > P_chap == False`` and misleadingly lowers
+    # the rate — refuse to proceed.
+    if np.isnan(leaf_probs_clean).any():
+        n_nan = int(np.isnan(leaf_probs_clean).sum())
+        bad_disease_idx = np.where(np.isnan(leaf_probs_clean).any(axis=0))[0]
+        bad_diseases = [present[i] for i in bad_disease_idx]
+        raise RuntimeError(
+            f"{n_nan} NaN cells remain in leaf_probs after dropping "
+            f"missing-prediction diseases; affected diseases: {bad_diseases}. "
+            "This indicates partial eid alignment — some eids in "
+            "eval_set_labels.csv have no corresponding prediction row. "
+            "Refusing to write HVR: NaN comparisons silently read as "
+            "non-violations and deflate the metric. Fix the upstream eval "
+            "run so every eid gets a prediction, or drop the mismatched "
+            "eids from eval_set_labels.csv."
+        )
     sub_disease_to_chap = {
         new_idx: full_disease_to_chap[old_idx]
         for new_idx, old_idx in enumerate(present_idx)

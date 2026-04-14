@@ -168,6 +168,67 @@ def test_load_e0_leaf_probs_partial_dir():
     assert np.all(np.isnan(leaf_probs[:, hypertension_idx]))
 
 
+def test_load_e0_leaf_probs_skips_disease_with_no_eid_overlap(tmp_path):
+    """A prediction file with eids that don't match labels → disease NOT present.
+
+    Codex P2 on PR #5 (round 2): previously such a file made it into
+    ``present`` with an all-NaN column. Then HVR's NaN comparisons read as
+    non-violations and silently deflate the rate.
+    """
+    from src.data.endpoints import get_disease_names
+    diseases = get_disease_names()
+
+    eval_dir = tmp_path / "stale_dir"
+    eval_dir.mkdir()
+    (eval_dir / "eval_set_labels.csv").write_text("eid\n1\n2\n3\n")
+
+    t2d_dir = eval_dir / "T2D"
+    t2d_dir.mkdir()
+    # Predictions for eids 999/998/997 — not a single one overlaps with
+    # labels (1/2/3). Simulates stale artifact or dtype drift.
+    (t2d_dir / "predictions_ckpt_T2D.csv").write_text(
+        "eid,prob_ckpt_T2D\n999,0.5\n998,0.6\n997,0.7\n"
+    )
+
+    leaf_probs, present = ehv.load_e0_leaf_probs(eval_dir, diseases)
+    assert "T2D" not in present
+    # The T2D column should still be all NaN (loader initialises NaN and we
+    # never aligned any row), but since T2D is not in ``present``, it'll be
+    # dropped by run_e0_baseline_mode before it can deflate HVR.
+    t2d_idx = diseases.index("T2D")
+    assert np.all(np.isnan(leaf_probs[:, t2d_idx]))
+
+
+def test_run_e0_baseline_mode_partial_alignment_raises(tmp_path):
+    """Partial eid alignment leaves NaNs → must raise, not write a misleading rate.
+
+    Setup: labels has eids 1/2/3; T2D predictions align only eid 1 (covers
+    1/3 rows). obesity predictions align all 3. After ``load_e0_leaf_probs``
+    drops nothing (both diseases had ≥1 aligned row), ``run_e0_baseline_mode``
+    still has 2 NaN cells in the T2D column and must refuse to proceed.
+    """
+    eval_dir = tmp_path / "partial_dir"
+    eval_dir.mkdir()
+    (eval_dir / "eval_set_labels.csv").write_text("eid\n1\n2\n3\n")
+
+    t2d_dir = eval_dir / "T2D"
+    t2d_dir.mkdir()
+    (t2d_dir / "predictions_ckpt_T2D.csv").write_text(
+        # Only eid 1 aligns; eids 4/5 are unknown.
+        "eid,prob_ckpt_T2D\n1,0.9\n4,0.1\n5,0.2\n"
+    )
+    obesity_dir = eval_dir / "obesity"
+    obesity_dir.mkdir()
+    (obesity_dir / "predictions_ckpt_obesity.csv").write_text(
+        "eid,prob_ckpt_obesity\n1,0.3\n2,0.4\n3,0.5\n"
+    )
+
+    out_path = tmp_path / "should_not_be_written.json"
+    with pytest.raises(RuntimeError, match="NaN cells remain in leaf_probs"):
+        ehv.run_e0_baseline_mode(eval_dir, out_path)
+    assert not out_path.exists()
+
+
 def test_run_e0_baseline_mode_empty_dir_raises(tmp_path):
     """When NO predictions are found, refuse to write a fake HVR=0.0.
 
