@@ -285,3 +285,258 @@ def run_e0_baseline_mode(
         },
         disease_to_chapter_idx=sub_disease_to_chap,
     )
+
+
+def run_multitask_mode(
+    config_path: Path,
+    output_dir: Path,
+    mean_output_path: Path,
+    head_output_path: Path,
+    batch_size: int = 512,
+) -> tuple[dict, dict]:
+    """Multitask mode: load ``output_dir/best_model.pt``, GPU-forward val.csv,
+    extract ``(leaf_probs, head_chap_probs)`` from the dual-head model,
+    compute HVR **twice** (once with mean-aggregated chap probs for
+    cross-model comparability with E0, once with the explicit chapter head
+    output for the loss-target-native metric), persist **two** sidecar JSONs.
+
+    Returns ``(mean_payload, head_payload)``.
+    """
+    import csv
+    import torch
+
+    from src.config import load_config
+    from src.data.biomarkers import get_metabolite_names
+    from src.data.endpoints import (
+        get_disease_names,
+        get_disease_to_chapter_idx,
+        get_unique_chapters,
+    )
+    from src.model.backbone import MetaboliteBERTModel
+    from src.model.heads import HierarchicalMultiTaskHead
+    from src.model.wrapper import MetaboLMForClassification
+
+    cfg = load_config(str(config_path))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("Device: %s", device)
+
+    feature_cols = get_metabolite_names()
+    disease_names = get_disease_names()
+    label_cols = [f"label_{d}" for d in disease_names]
+
+    # Stream val.csv into two float32 arrays (features + labels are tiny here).
+    with open(cfg.data.val_path, "r") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+    feat_indices = [header.index(c) for c in feature_cols]
+    # Label columns are optional (not used here, but we keep the shape check).
+    missing_labels = [c for c in label_cols if c not in header]
+    if missing_labels:
+        logger.warning(
+            "val.csv missing label columns: %s — HVR only needs features, "
+            "continuing without them.", missing_labels[:3]
+        )
+
+    X_rows: list[list[float]] = []
+    with open(cfg.data.val_path, "r") as f:
+        reader = csv.reader(f)
+        next(reader)
+        for row in reader:
+            X_rows.append([float(row[i]) for i in feat_indices])
+    X_val = np.array(X_rows, dtype=np.float32)
+    logger.info(
+        "Loaded val.csv: %d samples × %d features",
+        X_val.shape[0], X_val.shape[1],
+    )
+
+    # Reuse eval_e0_global's correlation matrix loader (.pt + CSV fallback) so
+    # the bias matrix resolves the same way the training pipeline does.
+    # scripts/ is not a package, so use the file-based import pattern.
+    import importlib.util
+    _ee0_spec = importlib.util.spec_from_file_location(
+        "eval_e0_global",
+        str(Path(__file__).resolve().parent / "eval_e0_global.py"),
+    )
+    _ee0 = importlib.util.module_from_spec(_ee0_spec)
+    _ee0_spec.loader.exec_module(_ee0)
+    bias_matrix = _ee0.load_correlation_matrix(cfg, device)
+
+    ckpt_path = output_dir / "best_model.pt"
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Multitask checkpoint not found: {ckpt_path}")
+    state_dict = torch.load(str(ckpt_path), map_location=device)
+
+    n_chapters = len(get_unique_chapters())
+    backbone = MetaboliteBERTModel(num_metabolites=len(feature_cols))
+    head = HierarchicalMultiTaskHead(
+        hidden_size=768,
+        num_diseases=len(disease_names),
+        num_chapters=n_chapters,
+    )
+    model = MetaboLMForClassification(backbone, head)
+
+    cleaned = {
+        (k.replace("module.", "") if k.startswith("module.") else k): v
+        for k, v in state_dict.items()
+    }
+    model.load_state_dict(cleaned, strict=False)
+    model.metabolite_model.register_buffer("bias_matrix_full", bias_matrix)
+    model.to(device)
+    model.eval()
+
+    leaf_chunks: list[np.ndarray] = []
+    chap_chunks: list[np.ndarray] = []
+    with torch.no_grad():
+        for start in range(0, X_val.shape[0], batch_size):
+            end = min(start + batch_size, X_val.shape[0])
+            x = torch.tensor(X_val[start:end], dtype=torch.float32, device=device)
+            mask = torch.ones(x.size(), dtype=torch.long, device=device)
+            (leaf_logits, chap_logits), _ = model(x, mask)
+            leaf_chunks.append(torch.sigmoid(leaf_logits).cpu().numpy())
+            chap_chunks.append(torch.sigmoid(chap_logits).cpu().numpy())
+    leaf_probs = np.concatenate(leaf_chunks, axis=0)
+    head_chap_probs = np.concatenate(chap_chunks, axis=0)
+
+    # Derive the mean-aggregated chap probs from the SAME leaf outputs so we
+    # get the cross-model-comparable metric alongside the head-native one
+    # without a second forward.
+    disease_to_chap = get_disease_to_chapter_idx()
+    mean_chap_probs = mean_aggregate_chapter_probs(
+        leaf_probs,
+        disease_to_chapter_idx=disease_to_chap,
+        n_chapters=n_chapters,
+    )
+
+    method_details_common = {
+        "model_path": str(ckpt_path),
+        "config_path": str(config_path),
+        "val_path": cfg.data.val_path,
+        "n_features": X_val.shape[1],
+    }
+
+    mean_payload = compute_and_persist_hvr(
+        leaf_probs=leaf_probs,
+        chap_probs=mean_chap_probs,
+        output_path=mean_output_path,
+        method="mean_aggregate_multitask",
+        method_details={
+            **method_details_common,
+            "chap_probs_source": (
+                "P_chap = mean(p_leaf for leaf in chapter); identical recipe to "
+                "E0 baseline. Use for cross-model comparison."
+            ),
+        },
+    )
+    head_payload = compute_and_persist_hvr(
+        leaf_probs=leaf_probs,
+        chap_probs=head_chap_probs,
+        output_path=head_output_path,
+        method="explicit_chapter_head",
+        method_details={
+            **method_details_common,
+            "chap_probs_source": (
+                "P_chap = sigmoid(chapter_head_logits); the distribution the "
+                "hierarchy loss was trained against. Only defined for "
+                "multitask models with an explicit chapter head."
+            ),
+        },
+    )
+    return mean_payload, head_payload
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────
+
+def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compute Hierarchy Violation Rate (HVR). Two modes: "
+            "`multitask` (E1-E4, writes mean-agg + head-native sidecars in "
+            "one forward) and `e0-mean` (E0 baseline from per-ckpt CSVs)."
+        ),
+    )
+    sub = parser.add_subparsers(dest="mode", required=True)
+
+    mt = sub.add_parser(
+        "multitask",
+        help=(
+            "Load best_model.pt and forward val.csv. Writes BOTH "
+            "hierarchy_violation_mean.json and hierarchy_violation_head.json."
+        ),
+    )
+    mt.add_argument(
+        "--config", type=Path, required=True,
+        help="Config YAML (e.g. configs/sft_full_ft.yaml).",
+    )
+    mt.add_argument(
+        "--output-dir", type=Path, required=True,
+        help=(
+            "Experiment output dir containing best_model.pt "
+            "(e.g. outputs/E1_sft_full_ft). Sidecar JSONs are written here "
+            "by default."
+        ),
+    )
+    mt.add_argument(
+        "--mean-output-json", type=Path, default=None,
+        help=(
+            "Override path for hierarchy_violation_mean.json. "
+            "Defaults to <output-dir>/hierarchy_violation_mean.json."
+        ),
+    )
+    mt.add_argument(
+        "--head-output-json", type=Path, default=None,
+        help=(
+            "Override path for hierarchy_violation_head.json. "
+            "Defaults to <output-dir>/hierarchy_violation_head.json."
+        ),
+    )
+    mt.add_argument("--batch-size", type=int, default=512)
+
+    e0 = sub.add_parser(
+        "e0-mean",
+        help="Read E0 per-ckpt predictions and mean-aggregate to baseline HVR.",
+    )
+    e0.add_argument(
+        "--eval-dir", type=Path, required=True,
+        help=(
+            "Eval output dir produced by scripts/eval_e0_global*.py "
+            "(e.g. outputs/E0_global_eval_cohort)."
+        ),
+    )
+    e0.add_argument(
+        "--output-json", type=Path, default=None,
+        help=(
+            "Where to write hierarchy_violation_mean.json. Defaults to "
+            "outputs/E0_reproduction/hierarchy_violation_mean.json."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    if args.mode == "multitask":
+        mean_out = args.mean_output_json or (
+            args.output_dir / "hierarchy_violation_mean.json"
+        )
+        head_out = args.head_output_json or (
+            args.output_dir / "hierarchy_violation_head.json"
+        )
+        run_multitask_mode(
+            config_path=args.config,
+            output_dir=args.output_dir,
+            mean_output_path=mean_out,
+            head_output_path=head_out,
+            batch_size=args.batch_size,
+        )
+    elif args.mode == "e0-mean":
+        out_json = args.output_json or Path(
+            "outputs/E0_reproduction/hierarchy_violation_mean.json"
+        )
+        run_e0_baseline_mode(eval_dir=args.eval_dir, output_path=out_json)
+    else:
+        parser.error(f"unknown mode: {args.mode}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
