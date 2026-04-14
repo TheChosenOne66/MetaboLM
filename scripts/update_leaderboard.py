@@ -87,6 +87,14 @@ class ExperimentRow:
     # the explicit chapter head, only defined for multitask models.
     hierarchy_violation_rate_mean: float | None = None
     hierarchy_violation_rate_head: float | None = None
+    # Coverage: n_leaf_chapter_pairs from the sidecar payload. A full run
+    # covers ``total_diseases`` pairs (= 16). Partial runs (e.g. E0 locally
+    # with only T2D predictions on disk) cover fewer. The renderer annotates
+    # the rendered cell with ``(n/total)`` when partial so a ``0.000`` doesn't
+    # silently look "hierarchy-perfect" when it actually means "we only had
+    # 1 disease and single-leaf chapters can't violate". Codex P2 round 3.
+    hierarchy_violation_n_pairs_mean: int | None = None
+    hierarchy_violation_n_pairs_head: int | None = None
     trainable_params: int | None = None
     total_params: int | None = None
     freeze_strategy: str | None = None
@@ -228,29 +236,46 @@ def load_manifest(path: Path) -> Manifest:
 # ── Parsers ───────────────────────────────────────────────────────────────
 
 
-def _read_hvr_sidecar(path: Path, *, context: str) -> float | None:
-    """Read ``hierarchy_violation_rate`` from a sidecar JSON, or return None.
+def _read_hvr_sidecar(
+    path: Path, *, context: str
+) -> tuple[float | None, int | None]:
+    """Read ``(hierarchy_violation_rate, n_leaf_chapter_pairs)`` from a sidecar JSON.
 
     Shared by ``parse_per_disease_sft`` (reads ``_mean``) and
-    ``parse_multitask`` (reads both ``_mean`` and ``_head``). Returns None
-    when the file is absent OR unreadable — a malformed sidecar should not
-    blow up the whole leaderboard regen, just warn.
+    ``parse_multitask`` (reads both ``_mean`` and ``_head``). Returns
+    ``(None, None)`` when the file is absent OR unreadable — a malformed
+    sidecar should not blow up the whole leaderboard regen, just warn.
 
-    ``context`` is prepended to any warning so the log points at the exp dir
-    that produced the bad file.
+    The ``n_leaf_chapter_pairs`` field is surfaced so downstream rendering
+    can distinguish a full run (16 pairs, or however many diseases the
+    manifest lists) from a partial one (e.g. E0 locally with only T2D
+    predictions on disk → 1 pair). Without this, a leaderboard cell
+    showing ``0.000`` is ambiguous — it could mean "model is hierarchy-
+    perfect" or "metric was computed on a strict subset and says nothing".
+    Codex P2 on PR #5 (round 3).
+
+    ``context`` is prepended to any warning so the log points at the exp
+    dir that produced the bad file.
     """
     if not path.exists():
-        return None
+        return (None, None)
     try:
         payload = json.loads(path.read_text())
-        return float(payload.get("hierarchy_violation_rate"))
+        rate = float(payload.get("hierarchy_violation_rate"))
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         print(
             f"[WARN] {context}: {path.name} unreadable ({exc}); "
             f"treating HVR as missing",
             file=sys.stderr,
         )
-        return None
+        return (None, None)
+    # n_leaf_chapter_pairs is optional — older sidecars may not have it.
+    n_pairs_raw = payload.get("n_leaf_chapter_pairs")
+    try:
+        n_pairs = int(n_pairs_raw) if n_pairs_raw is not None else None
+    except (TypeError, ValueError):
+        n_pairs = None
+    return (rate, n_pairs)
 
 
 def parse_per_disease_sft(
@@ -270,6 +295,8 @@ def parse_per_disease_sft(
         "mean_auprc": None,
         "hierarchy_violation_rate_mean": None,
         "hierarchy_violation_rate_head": None,
+        "hierarchy_violation_n_pairs_mean": None,
+        "hierarchy_violation_n_pairs_head": None,
         "per_disease_auroc": {},
         "per_disease_auprc": {},
         "trainable_params": None,
@@ -381,7 +408,7 @@ def parse_per_disease_sft(
     # Read the HVR (mean) sidecar produced by
     # scripts/eval_hierarchy_violation.py e0-mean. Only ``_mean`` is defined
     # for E0 (no chapter head exists to derive ``_head`` from).
-    hvr_mean = _read_hvr_sidecar(
+    hvr_mean, hvr_mean_n_pairs = _read_hvr_sidecar(
         exp_dir / "hierarchy_violation_mean.json",
         context=f"parse_per_disease_sft({exp_dir.name})",
     )
@@ -392,6 +419,8 @@ def parse_per_disease_sft(
         "mean_auprc": None,  # E0 CSV has no AUPRC
         "hierarchy_violation_rate_mean": hvr_mean,
         "hierarchy_violation_rate_head": None,
+        "hierarchy_violation_n_pairs_mean": hvr_mean_n_pairs,
+        "hierarchy_violation_n_pairs_head": None,
         "per_disease_auroc": per_disease_auroc,
         "per_disease_auprc": {},
         "trainable_params": None,  # E0 hardcoded size, not in CSV
@@ -422,6 +451,8 @@ def parse_multitask(
         "mean_auprc": None,
         "hierarchy_violation_rate_mean": None,
         "hierarchy_violation_rate_head": None,
+        "hierarchy_violation_n_pairs_mean": None,
+        "hierarchy_violation_n_pairs_head": None,
         "per_disease_auroc": {},
         "per_disease_auprc": {},
         "trainable_params": None,
@@ -514,11 +545,11 @@ def parse_multitask(
     # scripts/eval_hierarchy_violation.py multitask. Both optional — a
     # pre-sidecar training run still records HVR in summary.json, which we
     # treat as ``_head`` since the training objective used the chapter head.
-    hvr_mean = _read_hvr_sidecar(
+    hvr_mean, hvr_mean_n_pairs = _read_hvr_sidecar(
         exp_dir / "hierarchy_violation_mean.json",
         context=f"parse_multitask({exp_dir.name})",
     )
-    hvr_head = _read_hvr_sidecar(
+    hvr_head, hvr_head_n_pairs = _read_hvr_sidecar(
         exp_dir / "hierarchy_violation_head.json",
         context=f"parse_multitask({exp_dir.name})",
     )
@@ -527,6 +558,9 @@ def parse_multitask(
         if legacy is not None:
             try:
                 hvr_head = float(legacy)
+                # Legacy training-time HVR had no sidecar payload, so we
+                # can't infer coverage — leave n_pairs None, which the
+                # renderer treats as "coverage unknown, no annotation".
             except (TypeError, ValueError):
                 pass
 
@@ -536,6 +570,8 @@ def parse_multitask(
         "mean_auprc": None,  # Not emitted by current trainers
         "hierarchy_violation_rate_mean": hvr_mean,
         "hierarchy_violation_rate_head": hvr_head,
+        "hierarchy_violation_n_pairs_mean": hvr_mean_n_pairs,
+        "hierarchy_violation_n_pairs_head": hvr_head_n_pairs,
         "per_disease_auroc": per_disease_auroc,
         "per_disease_auprc": {},
         "trainable_params": _int_or_none(summary.get("trainable_params")),
@@ -668,6 +704,8 @@ def collect_experiment_rows(
                 "mean_auprc": None,
                 "hierarchy_violation_rate_mean": None,
                 "hierarchy_violation_rate_head": None,
+                "hierarchy_violation_n_pairs_mean": None,
+                "hierarchy_violation_n_pairs_head": None,
                 "per_disease_auroc": {},
                 "per_disease_auprc": {},
                 "trainable_params": None,
@@ -707,6 +745,8 @@ def collect_experiment_rows(
             mean_auprc=parsed["mean_auprc"],
             hierarchy_violation_rate_mean=parsed["hierarchy_violation_rate_mean"],
             hierarchy_violation_rate_head=parsed["hierarchy_violation_rate_head"],
+            hierarchy_violation_n_pairs_mean=parsed["hierarchy_violation_n_pairs_mean"],
+            hierarchy_violation_n_pairs_head=parsed["hierarchy_violation_n_pairs_head"],
             trainable_params=parsed["trainable_params"],
             total_params=parsed["total_params"],
             freeze_strategy=parsed["freeze_strategy"],
@@ -726,6 +766,27 @@ def collect_experiment_rows(
 
 
 # ── Rendering ─────────────────────────────────────────────────────────────
+
+def _format_hvr(
+    value: float | None, n_pairs: int | None, total: int,
+) -> str:
+    """Render an HVR cell, annotating coverage when partial.
+
+    - ``None`` → ``—`` (no sidecar / not applicable).
+    - Full coverage (``n_pairs == total`` or ``n_pairs is None`` for legacy
+      summary.json fallback where coverage is unknown but presumed full) →
+      plain ``0.000`` style.
+    - Partial coverage → ``0.000 (n/total)`` so a low rate from a sparse
+      disease set can't be mistaken for a hierarchy-perfect model. Codex
+      P2 round 3.
+    """
+    if value is None:
+        return "—"
+    base = f"{value:.3f}"
+    if n_pairs is None or n_pairs >= total:
+        return base
+    return f"{base} ({n_pairs}/{total})"
+
 
 def _format_float(value: float | None, decimals: int = 3) -> str:
     if value is None:
@@ -965,8 +1026,8 @@ def render_markdown(rows: list[ExperimentRow], diseases: list[str]) -> str:
             f"{_format_status(row)} | "
             f"{_format_mean_with_partial_warning(row)} | "
             f"{_format_float(row.mean_auprc)} | "
-            f"{_format_float(row.hierarchy_violation_rate_mean)} | "
-            f"{_format_float(row.hierarchy_violation_rate_head)} | "
+            f"{_format_hvr(row.hierarchy_violation_rate_mean, row.hierarchy_violation_n_pairs_mean, row.total_diseases)} | "
+            f"{_format_hvr(row.hierarchy_violation_rate_head, row.hierarchy_violation_n_pairs_head, row.total_diseases)} | "
             f"{_format_params(row.trainable_params, row.total_params)} | "
             f"{row.best_epoch if row.best_epoch is not None else '—'} |"
         )
@@ -978,7 +1039,10 @@ def render_markdown(rows: list[ExperimentRow], diseases: list[str]) -> str:
         "rows — see *Global-Val Diagnostics* below for apples-to-apples numbers · "
         "HVR (mean) = P_chap from mean-aggregated leaf probs "
         "(cross-model-comparable) · "
-        "HVR (head) = P_chap from explicit chapter head (multitask models only)"
+        "HVR (head) = P_chap from explicit chapter head (multitask models only) · "
+        "HVR ``(n/total)`` annotation = metric computed on only n of total "
+        "leaf-chapter pairs — a low rate there is not comparable to a "
+        "full-coverage cell"
     )
     lines.append("")
 
@@ -1086,8 +1150,8 @@ def render_readme_section(
             f"{_format_status(row)} | "
             f"{_format_mean_with_partial_warning(row)} | "
             f"{_format_float(row.mean_auprc)} | "
-            f"{_format_float(row.hierarchy_violation_rate_mean)} | "
-            f"{_format_float(row.hierarchy_violation_rate_head)} | "
+            f"{_format_hvr(row.hierarchy_violation_rate_mean, row.hierarchy_violation_n_pairs_mean, row.total_diseases)} | "
+            f"{_format_hvr(row.hierarchy_violation_rate_head, row.hierarchy_violation_n_pairs_head, row.total_diseases)} | "
             f"{_format_params(row.trainable_params, row.total_params)} | "
             f"{row.best_epoch if row.best_epoch is not None else '—'} |"
         )
@@ -1099,7 +1163,10 @@ def render_readme_section(
         "rows — see *Global-Val Diagnostics* below for apples-to-apples numbers · "
         "HVR (mean) = P_chap from mean-aggregated leaf probs "
         "(cross-model-comparable) · "
-        "HVR (head) = P_chap from explicit chapter head (multitask models only)"
+        "HVR (head) = P_chap from explicit chapter head (multitask models only) · "
+        "HVR ``(n/total)`` annotation = metric computed on only n of total "
+        "leaf-chapter pairs — a low rate there is not comparable to a "
+        "full-coverage cell"
     )
     lines.append("")
 

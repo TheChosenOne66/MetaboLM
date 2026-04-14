@@ -426,8 +426,13 @@ def run_multitask_mode(
 
     n_chapters = len(get_unique_chapters())
     backbone = MetaboliteBERTModel(num_metabolites=len(feature_cols))
+    # Read head dimensions from the same cfg the ckpt was trained against.
+    # Hardcoded 768/256 previously → any experiment that overrode
+    # cfg.model.hidden_size or cfg.model.proj_size would fail to load with
+    # a size-mismatch. Codex P2 on PR #5 (round 3).
     head = HierarchicalMultiTaskHead(
-        hidden_size=768,
+        hidden_size=cfg.model.hidden_size,
+        proj_size=cfg.model.proj_size,
         num_diseases=len(disease_names),
         num_chapters=n_chapters,
     )
