@@ -203,7 +203,10 @@ def main() -> None:
         fp16=False,                                # strict FP32
         deepspeed=None,                            # plain DDP, no ZeRO
         logging_steps=50,
-        eval_strategy="epoch",
+        # Use the legacy name — accepted by transformers>=4.30 (our declared floor)
+        # all the way through current releases where it's still a valid alias.
+        # The newer ``eval_strategy`` name was only introduced in 4.41.
+        evaluation_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
         metric_for_best_model="mean_auc",
