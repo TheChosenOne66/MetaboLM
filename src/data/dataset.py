@@ -83,3 +83,40 @@ class MultiTaskDataset(Dataset):
             torch.tensor(self.leaf_labels[idx], dtype=torch.float32),
             torch.tensor(self.chapter_labels[idx], dtype=torch.float32),
         )
+
+
+class MultiTaskDictDataset(Dataset):
+    """Same as :class:`MultiTaskDataset` but returns a dict for HF Trainer.
+
+    HF Trainer expects ``__getitem__`` to return a dict that is unpacked
+    into ``compute_loss(model, inputs)`` as ``inputs["expressions"]``,
+    ``inputs["leaf_labels"]``, ``inputs["chapter_labels"]``.
+    """
+
+    def __init__(
+        self,
+        X: np.ndarray,
+        leaf_labels: np.ndarray,
+        disease_to_chapter_idx: dict[int, int],
+        num_chapters: int = 6,
+    ) -> None:
+        self.X = X.astype(np.float32)
+        self.leaf_labels = leaf_labels.astype(np.float32)
+        self.chapter_labels = np.zeros(
+            (len(leaf_labels), num_chapters), dtype=np.float32
+        )
+        for disease_idx, chapter_idx in disease_to_chapter_idx.items():
+            self.chapter_labels[:, chapter_idx] = np.maximum(
+                self.chapter_labels[:, chapter_idx],
+                self.leaf_labels[:, disease_idx],
+            )
+
+    def __len__(self) -> int:
+        return len(self.leaf_labels)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return {
+            "expressions": torch.tensor(self.X[idx], dtype=torch.float32),
+            "leaf_labels": torch.tensor(self.leaf_labels[idx], dtype=torch.float32),
+            "chapter_labels": torch.tensor(self.chapter_labels[idx], dtype=torch.float32),
+        }
