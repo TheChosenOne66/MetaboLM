@@ -1,0 +1,30 @@
+# E1 ablation: μ=0.5 — hierarchy loss weight sweep (EXP-000 Phase 1)
+# Identical to configs/sft_full_ft.yaml except experiment / mu_hierarchy / output_dir.
+experiment: E1_sft_full_ft_mu_0.5
+seed: 42
+
+data:
+  train_path: data/processed/train.csv
+  val_path: data/processed/val.csv
+  correlation_matrix_path: data/processed/correlation_matrix.pt
+  num_metabolites: 168
+
+model:
+  pretrained_ckpt: weights/best_metabolite_bert_model.pt
+  head_type: hierarchical
+  freeze_strategy: none
+  hidden_size: 768
+  num_diseases: 16
+  proj_size: 256
+
+training:
+  mode: sft
+  batch_size: 512
+  learning_rate: 2.0e-5
+  num_epochs: 40
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  lambda_chapter: 1.0
+  mu_hierarchy: 0.5
+
+output_dir: outputs/E1_mu_sweep/mu_0.5

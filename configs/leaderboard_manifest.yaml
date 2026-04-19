@@ -76,6 +76,42 @@ experiments:
     description: "GRPO with hierarchy consistency reward"
     innovation: "Phase 3: RL exploration — hierarchy"
 
+experiment_groups:
+  # EXP-000 (2026-04-19) — Hierarchy-loss μ sweep on E1 Full FT.
+  # Rendering is optional for the existing update_leaderboard.py; this block is
+  # forward-compatible metadata consumed by scripts/analyze_mu_sweep.py.
+  - id: mu_sweep
+    display_name: "Hierarchy Loss μ Sweep (E1 ablation)"
+    parent: E1
+    description: "μ ∈ {0.0, 0.1, 0.5, 1.0, 3.0, 10.0} on sft_full_ft baseline"
+    render_as: subtable
+    sort_by: mu_hierarchy
+    members:
+      - id: E1_mu_0.0
+        config: configs/sft_full_ft_mu_0.0.yaml
+        output_dir: outputs/E1_mu_sweep/mu_0.0
+        mu_hierarchy: 0.0
+      - id: E1_mu_0.1
+        config: configs/sft_full_ft_mu_0.1.yaml
+        output_dir: outputs/E1_mu_sweep/mu_0.1
+        mu_hierarchy: 0.1
+      - id: E1_mu_0.5
+        config: configs/sft_full_ft_mu_0.5.yaml
+        output_dir: outputs/E1_mu_sweep/mu_0.5
+        mu_hierarchy: 0.5
+      - id: E1_mu_1.0
+        config: configs/sft_full_ft_mu_1.0.yaml
+        output_dir: outputs/E1_mu_sweep/mu_1.0
+        mu_hierarchy: 1.0
+      - id: E1_mu_3.0
+        config: configs/sft_full_ft_mu_3.0.yaml
+        output_dir: outputs/E1_mu_sweep/mu_3.0
+        mu_hierarchy: 3.0
+      - id: E1_mu_10.0
+        config: configs/sft_full_ft_mu_10.0.yaml
+        output_dir: outputs/E1_mu_sweep/mu_10.0
+        mu_hierarchy: 10.0
+
 # Disease names — MUST match the keys used in multitask_metrics.csv and
 # src/data/endpoints.py. Order below matches DISEASE_ENDPOINTS declaration
 # order in endpoints.py (chapter groupings: endocrine, circulatory,
