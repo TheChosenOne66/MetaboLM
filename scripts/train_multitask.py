@@ -233,12 +233,17 @@ def main() -> None:
     # ── Train ──
     trainer.train()
 
+    # ── Final predictions: ALL ranks must enter trainer.predict() because
+    #    HF Trainer's DDP prediction path does distributed collectives. Gating
+    #    this on rank-0 would deadlock non-zero ranks waiting at the later
+    #    dist.barrier(). File I/O below is still rank-0-only.
+    preds = trainer.predict(val_ds)
+
     # ── Save final artefacts (rank 0 only) ──
     if is_main_process():
         os.makedirs(cfg.output_dir, exist_ok=True)
 
-        # Per-disease predictions (best model already loaded via load_best_model_at_end=True)
-        preds = trainer.predict(val_ds)
+        # Best model already loaded via load_best_model_at_end=True
         leaf_probs = preds.predictions
         leaf_labels = preds.label_ids
         metrics = compute_multitask_metrics(leaf_labels, leaf_probs, disease_names)
