@@ -31,8 +31,10 @@ venv/
 .DS_Store
 Thumbs.db
 
-# Nebula runtime
+# Nebula runtime (auto-generated)
 cluster.json
-do.sh
 entry.py
 nebula_task.json
+
+# Autoresearch state (local-only experiment metadata)
+.autoresearch/
