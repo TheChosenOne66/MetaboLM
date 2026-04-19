@@ -21,6 +21,11 @@ if [[ -z "${NUM_GPUS:-}" ]]; then
 fi
 
 # Shared sweep helper: single-GPU → python, multi-GPU → torchrun.
+# Multi-GPU is launched via ``${PY} -m torch.distributed.run`` instead of bare
+# ``torchrun`` on PATH. ``torchrun`` is a thin shim over
+# torch.distributed.run, and in environments where ${PY} is an explicit conda
+# env (e.g. tjyprotenix) a PATH-resolved torchrun may point at a different
+# python interpreter that lacks project deps.
 run_one() {
     local cfg="$1"
     local out_dir="$2"
@@ -28,7 +33,7 @@ run_one() {
     local log="${out_dir}/train.log"
     echo "=== $(date -Iseconds) | config=${cfg} | NUM_GPUS=${NUM_GPUS} | log=${log} ==="
     if (( NUM_GPUS > 1 )); then
-        torchrun --standalone --nproc_per_node="${NUM_GPUS}" \
+        "${PY}" -m torch.distributed.run --standalone --nproc_per_node="${NUM_GPUS}" \
             scripts/train_multitask.py --config "${cfg}" 2>&1 | tee "${log}"
     else
         "${PY}" scripts/train_multitask.py --config "${cfg}" 2>&1 | tee "${log}"
