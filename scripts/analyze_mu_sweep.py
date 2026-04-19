@@ -229,8 +229,16 @@ def _tier_verdict(records: list[dict], e0_auc: float = 0.671) -> tuple[str, str]
         best = min(pareto, key=lambda r: r["hvr_head"])
         return "B", f"recommended μ_rec = {best['mu']} on HVR-AUROC Pareto"
 
-    # Tier C: all runs have HVR_head >= 0.2
-    if all(r["hvr_head"] >= 0.2 for r in records if not np.isnan(r["hvr_head"])):
+    # Tier C: all *valid* (non-NaN HVR_head) runs exceed 0.2. Require at least
+    # one valid run — otherwise the sweep is incomplete and a Tier C verdict
+    # would be silent misclassification (``all(empty) == True``).
+    valid = [r for r in records if not np.isnan(r["hvr_head"])]
+    if not valid:
+        return "incomplete", (
+            "no run produced a valid HVR_head value — re-run sweep or inspect "
+            "hierarchy_violation_head.json in each mu_*/"
+        )
+    if all(r["hvr_head"] >= 0.2 for r in valid):
         return "C", "no configuration achieves HVR_head < 0.2 — proceed to EXP-001 (mean-aggregated leaf target)"
 
     return "mixed", "intermediate result — see per-run numbers; most likely route EXP-001"
