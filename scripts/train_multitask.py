@@ -217,7 +217,14 @@ def main() -> None:
         remove_unused_columns=False,               # keep dict keys
         seed=cfg.seed,                             # same on every rank
         report_to="none",
-        ddp_find_unused_parameters=False,          # custom model has no unused params
+        # The pretrained MLM head (``MetaboliteBERTModel.output_layer``) is carried
+        # over from the pretraining checkpoint but is NOT in the SFT forward graph
+        # (`_embed_and_encode -> pooler -> head` bypasses it). Under DDP this trips
+        # the "parameters that were not used in producing loss" check. Enabling
+        # ``find_unused_parameters`` lets DDP skip these params each step; AdamW
+        # also skips params with ``grad=None``, so this is numerically identical
+        # to the single-GPU baseline.
+        ddp_find_unused_parameters=True,
         disable_tqdm=not is_main,
     )
 

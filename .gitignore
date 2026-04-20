@@ -32,9 +32,10 @@ venv/
 Thumbs.db
 
 # Nebula runtime (auto-generated)
-cluster.json
-entry.py
 nebula_task.json
+do.sh
+entry.py
+cluster.json
 
 # Autoresearch state (local-only experiment metadata)
 .autoresearch/

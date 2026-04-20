@@ -41,7 +41,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.config import load_config
+from src.config import _resolve_output_path, load_config
 from src.data.biomarkers import get_metabolite_names
 from src.data.endpoints import (
     get_disease_names,
@@ -351,6 +351,7 @@ def main() -> None:
         help="torch device override (default: cuda if available)",
     )
     args = parser.parse_args()
+    args.sweep_dir = Path(_resolve_output_path(str(args.sweep_dir)))
 
     device = torch.device(
         args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")

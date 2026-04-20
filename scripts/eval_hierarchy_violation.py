@@ -24,6 +24,20 @@ logging.basicConfig(
 logger = logging.getLogger("eval_hierarchy_violation")
 
 
+def _resolve_output_arg(path: Path | None) -> Path | None:
+    if path is None:
+        return None
+    from src.config import _resolve_output_path
+
+    return Path(_resolve_output_path(str(path)))
+
+
+def _resolve_required_output_arg(path: str | Path) -> Path:
+    from src.config import _resolve_output_path
+
+    return Path(_resolve_output_path(str(path)))
+
+
 def mean_aggregate_chapter_probs(
     leaf_probs: np.ndarray,
     disease_to_chapter_idx: dict[int, int],
@@ -653,24 +667,26 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.mode == "multitask":
-        mean_out = args.mean_output_json or (
-            args.output_dir / "hierarchy_violation_mean.json"
+        output_dir = _resolve_output_arg(args.output_dir)
+        mean_out = _resolve_output_arg(args.mean_output_json) or (
+            output_dir / "hierarchy_violation_mean.json"
         )
-        head_out = args.head_output_json or (
-            args.output_dir / "hierarchy_violation_head.json"
+        head_out = _resolve_output_arg(args.head_output_json) or (
+            output_dir / "hierarchy_violation_head.json"
         )
         run_multitask_mode(
             config_path=args.config,
-            output_dir=args.output_dir,
+            output_dir=output_dir,
             mean_output_path=mean_out,
             head_output_path=head_out,
             batch_size=args.batch_size,
         )
     elif args.mode == "e0-mean":
-        out_json = args.output_json or Path(
+        eval_dir = _resolve_output_arg(args.eval_dir)
+        out_json = _resolve_output_arg(args.output_json) or _resolve_required_output_arg(
             "outputs/E0_reproduction/hierarchy_violation_mean.json"
         )
-        run_e0_baseline_mode(eval_dir=args.eval_dir, output_path=out_json)
+        run_e0_baseline_mode(eval_dir=eval_dir, output_path=out_json)
     else:
         parser.error(f"unknown mode: {args.mode}")
     return 0
