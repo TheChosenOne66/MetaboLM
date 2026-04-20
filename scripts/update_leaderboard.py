@@ -143,9 +143,22 @@ class ManifestExperiment:
 
 
 @dataclass
+class ManifestExperimentGroup:
+    """Optional experiment group rendered as a secondary leaderboard section."""
+
+    id: str
+    display_name: str
+    parent: str | None
+    description: str
+    sort_by: str | None
+    members: list[dict[str, Any]]
+
+
+@dataclass
 class Manifest:
     experiments: list[ManifestExperiment]
     diseases: list[str]
+    experiment_groups: list[ManifestExperimentGroup] = field(default_factory=list)
 
 
 def load_manifest(path: Path) -> Manifest:
@@ -230,7 +243,37 @@ def load_manifest(path: Path) -> Manifest:
         print("ERROR: manifest 'diseases' must be a list of strings", file=sys.stderr)
         sys.exit(1)
 
-    return Manifest(experiments=experiments, diseases=list(diseases))
+    experiment_groups: list[ManifestExperimentGroup] = []
+    for i, entry in enumerate(raw.get("experiment_groups") or []):
+        if not isinstance(entry, dict):
+            print(
+                f"ERROR: experiment_group #{i} must be a mapping, got {type(entry).__name__}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        members = entry.get("members") or []
+        if not isinstance(members, list):
+            print(
+                f"ERROR: experiment_group {entry.get('id', '?')} members must be a list",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        experiment_groups.append(
+            ManifestExperimentGroup(
+                id=str(entry.get("id", f"group_{i}")),
+                display_name=str(entry.get("display_name", entry.get("id", f"group_{i}"))),
+                parent=entry.get("parent"),
+                description=str(entry.get("description", "")),
+                sort_by=entry.get("sort_by"),
+                members=[m for m in members if isinstance(m, dict)],
+            )
+        )
+
+    return Manifest(
+        experiments=experiments,
+        diseases=list(diseases),
+        experiment_groups=experiment_groups,
+    )
 
 
 # ── Parsers ───────────────────────────────────────────────────────────────
@@ -948,6 +991,129 @@ def _render_global_eval_diagnostics(
     return lines
 
 
+def _load_group_summary(
+    group: ManifestExperimentGroup, repo_root: Path
+) -> tuple[Path | None, pd.DataFrame | None, str | None]:
+    """Load a generated summary.csv/summary.md pair for an experiment group."""
+    if not group.members:
+        return (None, None, None)
+
+    first_output = group.members[0].get("output_dir")
+    if not first_output:
+        return (None, None, None)
+
+    group_dir = resolve_output_dir(str(first_output), repo_root).parent
+    summary_csv = group_dir / "summary.csv"
+    if not summary_csv.exists():
+        return (group_dir, None, None)
+
+    try:
+        df = pd.read_csv(summary_csv)
+    except Exception as exc:
+        print(
+            f"[WARN] experiment_group({group.id}): failed to read {summary_csv}: {exc}",
+            file=sys.stderr,
+        )
+        return (group_dir, None, None)
+
+    verdict = None
+    summary_md = group_dir / "summary.md"
+    if summary_md.exists():
+        try:
+            for line in summary_md.read_text().splitlines():
+                if line.startswith("**Verdict**:"):
+                    verdict = line.replace("**", "")
+                    break
+        except OSError as exc:
+            print(
+                f"[WARN] experiment_group({group.id}): failed to read {summary_md}: {exc}",
+                file=sys.stderr,
+            )
+
+    return (group_dir, df, verdict)
+
+
+def _render_experiment_groups(
+    groups: list[ManifestExperimentGroup],
+    repo_root: Path,
+    *,
+    heading_level: int = 2,
+    include_per_chapter: bool = True,
+) -> list[str]:
+    """Render optional grouped experiments such as EXP-000 mu sweep."""
+    rendered_groups: list[list[str]] = []
+    h = "#" * heading_level
+    sub_h = "#" * (heading_level + 1)
+
+    for group in groups:
+        group_dir, df, verdict = _load_group_summary(group, repo_root)
+        if df is None or df.empty:
+            continue
+
+        required = {"mu", "mean_auc", "hvr_mean", "hvr_head", "best_epoch"}
+        if not required.issubset(df.columns):
+            print(
+                f"[WARN] experiment_group({group.id}): summary.csv missing columns "
+                f"{sorted(required - set(df.columns))}; skipping",
+                file=sys.stderr,
+            )
+            continue
+
+        if group.sort_by and group.sort_by in df.columns:
+            df = df.sort_values(group.sort_by)
+        else:
+            df = df.sort_values("mu")
+
+        lines: list[str] = []
+        lines.append(f"{sub_h} {group.display_name}")
+        lines.append("")
+        if group.description:
+            lines.append(group.description)
+            lines.append("")
+        if verdict:
+            lines.append(f"**{verdict}**")
+            lines.append("")
+        if group_dir is not None:
+            rel_dir = os.path.relpath(group_dir, repo_root)
+            lines.append(f"Source: `{rel_dir}/summary.csv`")
+            lines.append("")
+
+        lines.append("| μ | Mean AUROC | HVR (mean) | HVR (head) | Best epoch |")
+        lines.append("|:---:|:---:|:---:|:---:|:---:|")
+        for _, r in df.iterrows():
+            lines.append(
+                f"| {r['mu']:g} | "
+                f"{float(r['mean_auc']):.4f} | "
+                f"{float(r['hvr_mean']):.4f} | "
+                f"{float(r['hvr_head']):.4f} | "
+                f"{int(r['best_epoch']) if pd.notna(r['best_epoch']) else '—'} |"
+            )
+        lines.append("")
+
+        if include_per_chapter:
+            chapter_cols = [c for c in df.columns if c.startswith("hvr_chap_")]
+            if chapter_cols:
+                lines.append("Per-chapter HVR uses the explicit chapter head.")
+                lines.append("")
+                chapter_names = [c.replace("hvr_chap_", "") for c in chapter_cols]
+                lines.append("| μ | " + " | ".join(chapter_names) + " |")
+                lines.append("|:---:|" + "|".join([":---:"] * len(chapter_cols)) + "|")
+                for _, r in df.iterrows():
+                    cells = [f"{float(r[c]):.4f}" for c in chapter_cols]
+                    lines.append(f"| {r['mu']:g} | " + " | ".join(cells) + " |")
+                lines.append("")
+
+        rendered_groups.append(lines)
+
+    if not rendered_groups:
+        return []
+
+    lines: list[str] = [f"{h} Experiment Groups", ""]
+    for group_lines in rendered_groups:
+        lines.extend(group_lines)
+    return lines
+
+
 def _format_status(row: ExperimentRow) -> str:
     if row.status == ExperimentStatus.COMPLETED:
         return "✅ Done"
@@ -991,7 +1157,12 @@ def _format_mean_with_partial_warning(row: ExperimentRow) -> str:
     return base + suffix
 
 
-def render_markdown(rows: list[ExperimentRow], diseases: list[str]) -> str:
+def render_markdown(
+    rows: list[ExperimentRow],
+    diseases: list[str],
+    experiment_groups: list[ManifestExperimentGroup] | None = None,
+    repo_root: Path = REPO_ROOT,
+) -> str:
     """Render the full LEADERBOARD.md content as a string."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1081,6 +1252,14 @@ def render_markdown(rows: list[ExperimentRow], diseases: list[str]) -> str:
     # Optional diagnostics section for experiments with ``eval_dirs``.
     lines.extend(_render_global_eval_diagnostics(rows, diseases))
 
+    # Optional grouped ablations (e.g. EXP-000 mu sweep).
+    lines.extend(_render_experiment_groups(
+        experiment_groups or [],
+        repo_root,
+        heading_level=2,
+        include_per_chapter=True,
+    ))
+
     # Experiment details
     lines.append("## Experiment Details")
     lines.append("")
@@ -1117,7 +1296,10 @@ README_END_MARKER = "<!-- LEADERBOARD:END -->"
 
 
 def render_readme_section(
-    rows: list[ExperimentRow], diseases: list[str]
+    rows: list[ExperimentRow],
+    diseases: list[str],
+    experiment_groups: list[ManifestExperimentGroup] | None = None,
+    repo_root: Path = REPO_ROOT,
 ) -> str:
     """Render the subset of the leaderboard suitable for embedding in README.
 
@@ -1214,6 +1396,15 @@ def render_readme_section(
             else:
                 lines.append(line)
 
+    group_lines = _render_experiment_groups(
+        experiment_groups or [],
+        repo_root,
+        heading_level=3,
+        include_per_chapter=False,
+    )
+    if group_lines:
+        lines.extend(group_lines)
+
     return "\n".join(lines)
 
 
@@ -1291,13 +1482,24 @@ def main() -> int:
     manifest = load_manifest(Path(args.manifest))
     rows = collect_experiment_rows(manifest, repo_root=Path(args.repo_root))
 
-    markdown = render_markdown(rows, manifest.diseases)
+    repo_root = Path(args.repo_root)
+    markdown = render_markdown(
+        rows,
+        manifest.diseases,
+        experiment_groups=manifest.experiment_groups,
+        repo_root=repo_root,
+    )
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(markdown)
 
     # Also inject a subset into README.md if markers are present
-    readme_section = render_readme_section(rows, manifest.diseases)
+    readme_section = render_readme_section(
+        rows,
+        manifest.diseases,
+        experiment_groups=manifest.experiment_groups,
+        repo_root=repo_root,
+    )
     readme_updated = inject_into_readme(Path(args.readme), readme_section)
 
     # Summary line to stdout
