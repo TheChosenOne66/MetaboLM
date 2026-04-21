@@ -137,18 +137,83 @@ def youden_optimal_thresholds(
         labels: ``(N, D)`` binary ground truth.
 
     Returns:
-        ``(D,)`` array of optimal thresholds.
+        ``(D,)`` array of finite thresholds. Degenerate columns (single-class,
+        or no finite threshold from ``roc_curve``) fall back to ``0.5``.
     """
     from sklearn.metrics import roc_curve
 
     n_cols = probs.shape[1]
     thresholds = np.full(n_cols, 0.5)
     for j in range(n_cols):
-        fpr, tpr, ths = roc_curve(labels[:, j], probs[:, j])
-        youden = tpr - fpr
-        best_idx = np.argmax(youden)
-        thresholds[j] = ths[best_idx]
+        col_labels = labels[:, j]
+        n_pos = int(col_labels.sum())
+        n_neg = int(len(col_labels) - n_pos)
+        # roc_curve is undefined when only one class is present in y_true.
+        if n_pos == 0 or n_neg == 0:
+            logger.warning(
+                "Column %d has only one class (pos=%d, neg=%d) — falling back to threshold 0.5.",
+                j, n_pos, n_neg,
+            )
+            continue
+
+        fpr, tpr, ths = roc_curve(col_labels, probs[:, j])
+        # sklearn's roc_curve prepends an artificial threshold of +inf (since 0.21)
+        # so that the curve starts at (0, 0). argmax-with-ties defaults to index 0,
+        # which would otherwise pick that +inf, making the whole column predict 0
+        # and serializing non-standard Infinity values to JSON.
+        finite = np.isfinite(ths)
+        if not finite.any():
+            logger.warning(
+                "Column %d: roc_curve returned no finite thresholds — falling back to 0.5.", j,
+            )
+            continue
+        fpr_f, tpr_f, ths_f = fpr[finite], tpr[finite], ths[finite]
+        youden = tpr_f - fpr_f
+        best_idx = int(np.argmax(youden))
+        thresholds[j] = float(ths_f[best_idx])
+
     return thresholds
+
+
+# ── Checkpoint load validation ───────────────────────────────────────────
+
+
+def _validate_state_dict_load(
+    load_result,
+    context: str,
+    allowed_missing_prefixes: tuple[str, ...] = (),
+) -> None:
+    """Fail fast on critical ``load_state_dict(strict=False)`` mismatches.
+
+    Silent ``strict=False`` loads can leave head / adapter / LoRA parameters
+    uninitialized when the supplied ``--config`` disagrees with the checkpoint,
+    and still produce plausible-looking hF1 numbers. We refuse to score in that
+    case. Unexpected keys (e.g. the unused MLM ``output_layer.*`` head from the
+    pretrained backbone) are only logged.
+    """
+    missing = list(getattr(load_result, "missing_keys", []) or [])
+    unexpected = list(getattr(load_result, "unexpected_keys", []) or [])
+
+    critical_missing = [
+        k for k in missing
+        if not any(k.startswith(p) for p in allowed_missing_prefixes)
+    ]
+    if critical_missing:
+        preview = critical_missing[:10]
+        more = f" ... (+{len(critical_missing) - 10} more)" if len(critical_missing) > 10 else ""
+        raise RuntimeError(
+            f"[{context}] Checkpoint load missing {len(critical_missing)} critical "
+            f"parameter(s): {preview}{more}. Likely --config mismatch with the "
+            f"checkpoint (freeze_strategy / adapter_bottleneck / lora_rank). "
+            f"Refusing to score — numbers would be misleading."
+        )
+    if unexpected:
+        preview = unexpected[:10]
+        more = f" ... (+{len(unexpected) - 10} more)" if len(unexpected) > 10 else ""
+        logger.warning(
+            "[%s] Checkpoint has %d unexpected key(s) (not used by this model): %s%s",
+            context, len(unexpected), preview, more,
+        )
 
 
 # ── Data loading utilities ───────────────────────────────────────────────
@@ -244,7 +309,11 @@ def forward_multitask_model(
         (k.replace("module.", "") if k.startswith("module.") else k): v
         for k, v in state_dict.items()
     }
-    model.load_state_dict(cleaned, strict=False)
+    load_result = model.load_state_dict(cleaned, strict=False)
+    _validate_state_dict_load(
+        load_result,
+        context=f"multitask / {ckpt_path.name} / config={config_path.name}",
+    )
     model.metabolite_model.register_buffer("bias_matrix_full", bias_matrix)
     model.to(device)
     model.eval()
@@ -321,7 +390,11 @@ def forward_e0_models(
             (k.replace("module.", "") if k.startswith("module.") else k): v
             for k, v in state_dict.items()
         }
-        model.load_state_dict(cleaned, strict=False)
+        load_result = model.load_state_dict(cleaned, strict=False)
+        _validate_state_dict_load(
+            load_result,
+            context=f"e0 / {disease} / {ckpt_path.name}",
+        )
         model.metabolite_model.register_buffer("bias_matrix_full", bias_matrix)
         model.to(device)
         model.eval()

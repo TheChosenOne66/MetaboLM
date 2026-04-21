@@ -19,7 +19,11 @@ _project_root = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, _project_root)
 sys.path.insert(0, str(Path(_project_root) / "scripts"))
 
-from eval_hierarchical_f1 import compute_hierarchical_f1
+from eval_hierarchical_f1 import (
+    _validate_state_dict_load,
+    compute_hierarchical_f1,
+    youden_optimal_thresholds,
+)
 
 D2C = {0: 0, 1: 0, 2: 1}  # 3 diseases, 2 chapters
 N_CHAP = 2
@@ -134,6 +138,94 @@ def test_no_predictions_no_labels():
     r = compute_hierarchical_f1(preds, labels, D2C, N_CHAP)
     assert r["hF1"] == pytest.approx(0.0)
     assert r["flat_F1"] == pytest.approx(0.0)
+
+
+def test_youden_thresholds_are_finite_on_normal_data():
+    """Regular two-class column → threshold is a finite value in (0, 1)."""
+    rng = np.random.default_rng(0)
+    labels = rng.integers(0, 2, size=(200, 3)).astype(np.int32)
+    # Force column 2 to have a strong positive signal so ROC is well-defined.
+    labels[:, 2] = (rng.random(200) < 0.3).astype(np.int32)
+    probs = rng.random((200, 3))
+    probs[:, 2] = np.where(labels[:, 2] == 1, rng.uniform(0.6, 1.0, 200), rng.uniform(0.0, 0.5, 200))
+
+    ths = youden_optimal_thresholds(probs, labels)
+    assert ths.shape == (3,)
+    assert np.all(np.isfinite(ths)), f"Thresholds contain non-finite values: {ths}"
+
+
+def test_youden_thresholds_single_class_column_falls_back_to_0_5():
+    """Single-class column (all positives or all negatives) → threshold = 0.5, no inf."""
+    # Column 0: mixed; Column 1: all zeros (no positives); Column 2: all ones (no negatives).
+    labels = np.zeros((100, 3), dtype=np.int32)
+    labels[:50, 0] = 1
+    labels[:, 2] = 1
+    rng = np.random.default_rng(1)
+    probs = rng.random((100, 3))
+
+    ths = youden_optimal_thresholds(probs, labels)
+    assert np.all(np.isfinite(ths)), f"Thresholds contain non-finite values: {ths}"
+    assert ths[1] == 0.5, "Single-class (all-negative) column should fall back to 0.5"
+    assert ths[2] == 0.5, "Single-class (all-positive) column should fall back to 0.5"
+
+
+def test_youden_thresholds_constant_scores_no_inf():
+    """Constant predicted scores (Youden ties at zero) → threshold is finite, not inf."""
+    labels = np.array([[1, 0, 1, 0, 1, 0, 1, 0]], dtype=np.int32).T  # (8, 1)
+    probs = np.full((8, 1), 0.5, dtype=np.float32)  # every score identical
+
+    ths = youden_optimal_thresholds(probs, labels)
+    assert np.isfinite(ths[0]), (
+        "argmax over ties must not pick the roc_curve +inf sentinel; "
+        f"got threshold = {ths[0]}"
+    )
+
+
+# ── _validate_state_dict_load ────────────────────────────────────────────
+
+
+class _FakeLoadResult:
+    def __init__(self, missing_keys, unexpected_keys):
+        self.missing_keys = list(missing_keys)
+        self.unexpected_keys = list(unexpected_keys)
+
+
+def test_validate_load_clean_passes():
+    _validate_state_dict_load(_FakeLoadResult([], []), context="test")  # no raise
+
+
+def test_validate_load_unexpected_keys_only_warns(caplog):
+    # Unexpected keys (e.g., MLM head) are non-fatal — should only log a warning.
+    with caplog.at_level("WARNING", logger="eval_hierarchical_f1"):
+        _validate_state_dict_load(
+            _FakeLoadResult(missing_keys=[], unexpected_keys=["output_layer.weight", "output_layer.bias"]),
+            context="test",
+        )
+    assert any("unexpected" in r.message.lower() for r in caplog.records)
+
+
+def test_validate_load_critical_missing_raises():
+    # Missing head parameters → critical config mismatch → must raise.
+    with pytest.raises(RuntimeError, match="missing .* critical parameter"):
+        _validate_state_dict_load(
+            _FakeLoadResult(
+                missing_keys=["head.leaf_classifier.weight", "head.leaf_classifier.bias"],
+                unexpected_keys=[],
+            ),
+            context="test",
+        )
+
+
+def test_validate_load_allowed_prefix_suppresses_missing():
+    # When a prefix is whitelisted, its missing keys are not critical.
+    _validate_state_dict_load(
+        _FakeLoadResult(
+            missing_keys=["metabolite_model.bias_matrix_full"],
+            unexpected_keys=[],
+        ),
+        context="test",
+        allowed_missing_prefixes=("metabolite_model.bias_matrix_full",),
+    )  # no raise
 
 
 def test_full_16_disease_mapping():
