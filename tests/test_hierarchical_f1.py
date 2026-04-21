@@ -20,6 +20,8 @@ sys.path.insert(0, _project_root)
 sys.path.insert(0, str(Path(_project_root) / "scripts"))
 
 from eval_hierarchical_f1 import (
+    _resolve_output_arg,
+    _resolve_required_output_arg,
     _validate_state_dict_load,
     compute_hierarchical_f1,
     youden_optimal_thresholds,
@@ -194,19 +196,9 @@ def test_validate_load_clean_passes():
     _validate_state_dict_load(_FakeLoadResult([], []), context="test")  # no raise
 
 
-def test_validate_load_unexpected_keys_only_warns(caplog):
-    # Unexpected keys (e.g., MLM head) are non-fatal — should only log a warning.
-    with caplog.at_level("WARNING", logger="eval_hierarchical_f1"):
-        _validate_state_dict_load(
-            _FakeLoadResult(missing_keys=[], unexpected_keys=["output_layer.weight", "output_layer.bias"]),
-            context="test",
-        )
-    assert any("unexpected" in r.message.lower() for r in caplog.records)
-
-
 def test_validate_load_critical_missing_raises():
     # Missing head parameters → critical config mismatch → must raise.
-    with pytest.raises(RuntimeError, match="missing .* critical parameter"):
+    with pytest.raises(RuntimeError, match=r"missing 2 parameter"):
         _validate_state_dict_load(
             _FakeLoadResult(
                 missing_keys=["head.leaf_classifier.weight", "head.leaf_classifier.bias"],
@@ -216,8 +208,39 @@ def test_validate_load_critical_missing_raises():
         )
 
 
-def test_validate_load_allowed_prefix_suppresses_missing():
-    # When a prefix is whitelisted, its missing keys are not critical.
+def test_validate_load_critical_unexpected_raises():
+    # The exact scenario Codex round-2 flagged: LoRA-trained ckpt (with lora_A /
+    # lora_B / *.original.* wrappers) loaded into a non-LoRA model produces
+    # unexpected keys that previously got downgraded to a warning. Must raise now.
+    with pytest.raises(RuntimeError, match=r"unexpected 3 parameter"):
+        _validate_state_dict_load(
+            _FakeLoadResult(
+                missing_keys=[],
+                unexpected_keys=[
+                    "metabolite_model.encoder.layers.0.attention.query.lora_A.weight",
+                    "metabolite_model.encoder.layers.0.attention.query.lora_B.weight",
+                    "metabolite_model.encoder.layers.0.attention.query.original.weight",
+                ],
+            ),
+            context="test",
+        )
+
+
+def test_validate_load_critical_missing_and_unexpected_raise_together():
+    # Both kinds at once are reported in one error message.
+    with pytest.raises(RuntimeError) as excinfo:
+        _validate_state_dict_load(
+            _FakeLoadResult(
+                missing_keys=["head.leaf_classifier.weight"],
+                unexpected_keys=["adapter.down_proj.weight"],
+            ),
+            context="test",
+        )
+    msg = str(excinfo.value)
+    assert "missing 1" in msg and "unexpected 1" in msg
+
+
+def test_validate_load_allowed_missing_prefix_suppresses():
     _validate_state_dict_load(
         _FakeLoadResult(
             missing_keys=["metabolite_model.bias_matrix_full"],
@@ -226,6 +249,44 @@ def test_validate_load_allowed_prefix_suppresses_missing():
         context="test",
         allowed_missing_prefixes=("metabolite_model.bias_matrix_full",),
     )  # no raise
+
+
+def test_validate_load_allowed_unexpected_prefix_suppresses(caplog):
+    # Whitelisted unexpected key (e.g., the bias_matrix_full buffer that is
+    # re-registered after load) must not raise and should surface as an info log.
+    with caplog.at_level("INFO", logger="eval_hierarchical_f1"):
+        _validate_state_dict_load(
+            _FakeLoadResult(
+                missing_keys=[],
+                unexpected_keys=["metabolite_model.bias_matrix_full"],
+            ),
+            context="test",
+            allowed_unexpected_prefixes=("metabolite_model.bias_matrix_full",),
+        )
+    assert any("whitelisted" in r.message.lower() for r in caplog.records)
+
+
+# ── _resolve_output_arg / _resolve_required_output_arg ───────────────────
+
+
+def test_resolve_output_arg_passes_through_without_env(monkeypatch):
+    monkeypatch.delenv("METABOLM_OUTPUT_BASE", raising=False)
+    assert _resolve_output_arg(None) is None
+    assert _resolve_output_arg(Path("outputs/foo/bar")) == Path("outputs/foo/bar")
+    assert _resolve_required_output_arg("outputs/foo/bar") == Path("outputs/foo/bar")
+
+
+def test_resolve_output_arg_remaps_under_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("METABOLM_OUTPUT_BASE", str(tmp_path))
+    # Relative "outputs/..." gets remapped: strip "outputs/" and prepend the base.
+    assert _resolve_required_output_arg("outputs/E1_mu_sweep/mu_10") == tmp_path / "E1_mu_sweep" / "mu_10"
+    # Non-"outputs/" relative paths are preserved under the base (per _resolve_output_path behavior).
+    assert _resolve_required_output_arg("E0_reproduction") == tmp_path / "E0_reproduction"
+    # Absolute paths are left untouched.
+    abs_path = tmp_path / "already/absolute"
+    assert _resolve_required_output_arg(abs_path) == abs_path
+    # Optional variant with None still returns None even with env set.
+    assert _resolve_output_arg(None) is None
 
 
 def test_full_16_disease_mapping():

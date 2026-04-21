@@ -35,6 +35,37 @@ logging.basicConfig(
 logger = logging.getLogger("eval_hierarchical_f1")
 
 
+# Buffer re-registered on the model AFTER load (see forward_*), so it legitimately
+# appears as an "unexpected" key at load time when the training checkpoint saved it.
+# Any OTHER unexpected key (LoRA / adapter wrappers like ``*.original.*`` /
+# ``*.lora_A`` when loading into a non-LoRA / non-adapter model) must fail loudly.
+_MULTITASK_ALLOWED_UNEXPECTED: tuple[str, ...] = (
+    "metabolite_model.bias_matrix_full",
+)
+_E0_ALLOWED_UNEXPECTED: tuple[str, ...] = (
+    "metabolite_model.bias_matrix_full",
+)
+
+
+# ── Output path resolver (METABOLM_OUTPUT_BASE remapping) ────────────────
+
+
+def _resolve_output_arg(path: Path | None) -> Path | None:
+    """Optional variant: ``None`` passes through."""
+    if path is None:
+        return None
+    from src.config import _resolve_output_path
+
+    return Path(_resolve_output_path(str(path)))
+
+
+def _resolve_required_output_arg(path: str | Path) -> Path:
+    """Required variant used for CLI args that must exist on disk."""
+    from src.config import _resolve_output_path
+
+    return Path(_resolve_output_path(str(path)))
+
+
 # ── Core metric ──────────────────────────────────────────────────────────
 
 
@@ -182,37 +213,62 @@ def _validate_state_dict_load(
     load_result,
     context: str,
     allowed_missing_prefixes: tuple[str, ...] = (),
+    allowed_unexpected_prefixes: tuple[str, ...] = (),
 ) -> None:
     """Fail fast on critical ``load_state_dict(strict=False)`` mismatches.
 
     Silent ``strict=False`` loads can leave head / adapter / LoRA parameters
     uninitialized when the supplied ``--config`` disagrees with the checkpoint,
     and still produce plausible-looking hF1 numbers. We refuse to score in that
-    case. Unexpected keys (e.g. the unused MLM ``output_layer.*`` head from the
-    pretrained backbone) are only logged.
+    case. Mismatches are checked in both directions:
+
+    - **missing** — parameter the model expects but the checkpoint does not
+      provide. Critical unless whitelisted via ``allowed_missing_prefixes``.
+    - **unexpected** — parameter the checkpoint carries but the model does not
+      declare. Critical unless whitelisted via ``allowed_unexpected_prefixes``.
+      This catches e.g. loading a LoRA-trained checkpoint against a non-LoRA
+      config: the LoRA wrappers / ``*.original.*`` keys become unexpected and
+      would otherwise be silently ignored while the base weights are only
+      half-initialized.
     """
     missing = list(getattr(load_result, "missing_keys", []) or [])
     unexpected = list(getattr(load_result, "unexpected_keys", []) or [])
 
-    critical_missing = [
-        k for k in missing
-        if not any(k.startswith(p) for p in allowed_missing_prefixes)
-    ]
+    def _filter(keys, prefixes):
+        return [k for k in keys if not any(k.startswith(p) for p in prefixes)]
+
+    critical_missing = _filter(missing, allowed_missing_prefixes)
+    critical_unexpected = _filter(unexpected, allowed_unexpected_prefixes)
+
+    errors: list[str] = []
     if critical_missing:
         preview = critical_missing[:10]
         more = f" ... (+{len(critical_missing) - 10} more)" if len(critical_missing) > 10 else ""
-        raise RuntimeError(
-            f"[{context}] Checkpoint load missing {len(critical_missing)} critical "
-            f"parameter(s): {preview}{more}. Likely --config mismatch with the "
-            f"checkpoint (freeze_strategy / adapter_bottleneck / lora_rank). "
-            f"Refusing to score — numbers would be misleading."
+        errors.append(
+            f"missing {len(critical_missing)} parameter(s): {preview}{more}"
         )
-    if unexpected:
-        preview = unexpected[:10]
-        more = f" ... (+{len(unexpected) - 10} more)" if len(unexpected) > 10 else ""
-        logger.warning(
-            "[%s] Checkpoint has %d unexpected key(s) (not used by this model): %s%s",
-            context, len(unexpected), preview, more,
+    if critical_unexpected:
+        preview = critical_unexpected[:10]
+        more = f" ... (+{len(critical_unexpected) - 10} more)" if len(critical_unexpected) > 10 else ""
+        errors.append(
+            f"unexpected {len(critical_unexpected)} parameter(s): {preview}{more}"
+        )
+    if errors:
+        joined = "; ".join(errors)
+        raise RuntimeError(
+            f"[{context}] Checkpoint load mismatch — {joined}. Likely --config "
+            f"mismatch with the checkpoint (freeze_strategy / adapter_bottleneck / "
+            f"lora_rank). Refusing to score — numbers would be misleading."
+        )
+
+    # Whitelisted unexpected keys (e.g. bias_matrix_full buffer registered
+    # post-load) are still worth surfacing so the operator knows they were
+    # dropped on purpose.
+    benign_unexpected = [k for k in unexpected if k not in critical_unexpected]
+    if benign_unexpected:
+        logger.info(
+            "[%s] Ignoring %d whitelisted unexpected key(s): %s",
+            context, len(benign_unexpected), benign_unexpected[:10],
         )
 
 
@@ -313,6 +369,7 @@ def forward_multitask_model(
     _validate_state_dict_load(
         load_result,
         context=f"multitask / {ckpt_path.name} / config={config_path.name}",
+        allowed_unexpected_prefixes=_MULTITASK_ALLOWED_UNEXPECTED,
     )
     model.metabolite_model.register_buffer("bias_matrix_full", bias_matrix)
     model.to(device)
@@ -394,6 +451,7 @@ def forward_e0_models(
         _validate_state_dict_load(
             load_result,
             context=f"e0 / {disease} / {ckpt_path.name}",
+            allowed_unexpected_prefixes=_E0_ALLOWED_UNEXPECTED,
         )
         model.metabolite_model.register_buffer("bias_matrix_full", bias_matrix)
         model.to(device)
@@ -500,7 +558,12 @@ def main() -> int:
         from src.config import load_config
         cfg = load_config(str(args.config))
 
-        ckpt_path = args.output_dir / "best_model.pt"
+        # Respect METABOLM_OUTPUT_BASE remapping used by the rest of the
+        # training / eval scripts — otherwise plain "outputs/..." args point
+        # to the wrong filesystem location and produce false "checkpoint not
+        # found" errors.
+        output_dir = _resolve_required_output_arg(args.output_dir)
+        ckpt_path = output_dir / "best_model.pt"
         if not ckpt_path.exists():
             logger.error("Checkpoint not found: %s", ckpt_path)
             return 1
@@ -521,7 +584,9 @@ def main() -> int:
 
         results = compute_hierarchical_f1(preds_binary, Y_val, disease_to_chap, n_chapters)
 
-        out_path = args.output_json or (args.output_dir / "hierarchical_f1.json")
+        out_path = _resolve_output_arg(args.output_json) or (
+            output_dir / "hierarchical_f1.json"
+        )
         persist_hf1(results, out_path, thresh_method, thresholds, disease_names, {
             "mode": "multitask",
             "config_path": str(args.config),
@@ -534,9 +599,12 @@ def main() -> int:
         from src.config import load_config
         cfg = load_config(str(sft_cfg_path))
 
+        # See note above — respect METABOLM_OUTPUT_BASE remapping.
+        e0_dir = _resolve_required_output_arg(args.e0_dir)
+
         X_val, Y_val, _ = load_val_features_and_labels(cfg.data.val_path)
         leaf_probs = forward_e0_models(
-            args.e0_dir, X_val, cfg.data.val_path, args.batch_size,
+            e0_dir, X_val, cfg.data.val_path, args.batch_size,
         )
 
         # Check for missing diseases
@@ -557,10 +625,12 @@ def main() -> int:
 
         results = compute_hierarchical_f1(preds_binary, Y_val, disease_to_chap, n_chapters)
 
-        out_path = args.output_json or (args.e0_dir / "hierarchical_f1.json")
+        out_path = _resolve_output_arg(args.output_json) or (
+            e0_dir / "hierarchical_f1.json"
+        )
         persist_hf1(results, out_path, thresh_method, thresholds, disease_names, {
             "mode": "e0",
-            "e0_dir": str(args.e0_dir),
+            "e0_dir": str(e0_dir),
         })
 
     logger.info("Done.")
